@@ -201,3 +201,29 @@ async def revoke_api_key(key_id: int) -> bool:
         )
         await conn.commit()
         return cursor.rowcount > 0
+
+
+async def update_scan_error(scan_id: str, error_message: str) -> None:
+    """Record a scan-level error (e.g. timeout, fatal tool failure)."""
+    async with get_connection() as conn:
+        await conn.execute(
+            "UPDATE scans SET status = 'FAILED', updated_at = datetime('now') WHERE scan_id = ?",
+            (scan_id,),
+        )
+        # Append to existing security_analysis_errors JSON, or create a new list.
+        row = await conn.execute(
+            "SELECT security_analysis_errors FROM scans WHERE scan_id = ?",
+            (scan_id,),
+        )
+        existing = (await row.fetchone())[0]
+        try:
+            errors: list = json.loads(existing) if existing else []
+        except (json.JSONDecodeError, TypeError):
+            errors = []
+        if error_message not in errors:
+            errors.append(error_message)
+        await conn.execute(
+            "UPDATE scans SET security_analysis_errors = ? WHERE scan_id = ?",
+            (json.dumps(errors), scan_id),
+        )
+        await conn.commit()

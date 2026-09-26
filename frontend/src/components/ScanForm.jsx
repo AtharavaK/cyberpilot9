@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
-import { Globe, Play, Loader2 } from 'lucide-react';
+import { Globe, Play, Loader2, Lock } from 'lucide-react';
 
-export default function ScanForm({ onScanStart, isScanning }) {
+export default function ScanForm({ onScanStart, isScanning, scanTimeout }) {
   const [url, setUrl] = useState('');
   const [error, setError] = useState('');
+  const [useRealTools, setUseRealTools] = useState(false);
 
   const handleSubmit = (e) => {
     e.preventDefault();
@@ -18,7 +19,9 @@ export default function ScanForm({ onScanStart, isScanning }) {
       setError('Please enter a valid URL (e.g., https://example.com).');
       return;
     }
-    onScanStart(url.trim(), true);  // true = simulation mode (default — real tools need explicit auth)
+    // Simulation is the safe default. Real tools require explicit opt-in
+    // AND a valid API key (backend enforces authorize=True for real scans).
+    onScanStart(url.trim(), !useRealTools, useRealTools);
   };
 
   return (
@@ -78,6 +81,35 @@ export default function ScanForm({ onScanStart, isScanning }) {
           )}
         </button>
       </form>
+      {/* Mode toggle — simulation is safe default; real tools need API key + explicit opt-in */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginTop: '1rem' }}>
+        <button
+          type="button"
+          onClick={() => setUseRealTools(!useRealTools)}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+            padding: '0.5rem 1rem',
+            borderRadius: '8px',
+            border: `1px solid ${useRealTools ? 'var(--accent-primary)' : 'var(--glass-border)'}`,
+            background: useRealTools ? 'rgba(0,240,255,0.08)' : 'transparent',
+            color: useRealTools ? 'var(--accent-primary)' : 'var(--text-secondary)',
+            fontFamily: 'var(--font-main)',
+            fontSize: '0.85rem',
+            cursor: 'pointer',
+            transition: 'all 0.2s',
+          }}
+        >
+          {useRealTools && <Lock size={14} />}
+          {useRealTools ? 'Real Tools (auth required)' : 'Simulation mode'}
+        </button>
+        {useRealTools && (
+          <p style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', margin: 0 }}>
+            Requires a valid API key. Backend enforces authorization for real scans.
+          </p>
+        )}
+      </div>
       {error && (
         <p style={{ marginTop: '0.75rem', color: 'var(--error)', fontSize: '0.85rem' }}>{error}</p>
       )}

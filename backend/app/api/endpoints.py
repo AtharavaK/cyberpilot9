@@ -28,6 +28,7 @@ async def start_scan(request: ScanRequest, current_user: dict = Depends(get_curr
             request.target_url,
             data_source=data_source,
             authorize=request.authorize,
+            scan_timeout_seconds=request.scan_timeout_seconds,
         )
     except ValueError as e:
         raise HTTPException(status_code=403, detail=str(e))

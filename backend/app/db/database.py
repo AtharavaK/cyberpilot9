@@ -16,15 +16,20 @@ async def init_db():
                 overall_score INTEGER,
                 final_report TEXT,
                 data_source TEXT DEFAULT 'real_tools',
+                security_analysis_errors TEXT DEFAULT '[]',
                 created_at  DATETIME DEFAULT (datetime('now')),
                 updated_at  DATETIME DEFAULT (datetime('now'))
             )
         """)
-        # Migration for existing databases: add data_source column
-        try:
-            await conn.execute("ALTER TABLE scans ADD COLUMN data_source TEXT DEFAULT 'real_tools'")
-        except aiosqlite.OperationalError:
-            pass  # Column already exists
+        # Migration for existing databases: add missing columns
+        for column_def, col_name in [
+            ("data_source TEXT DEFAULT 'real_tools'", "data_source"),
+            ("security_analysis_errors TEXT DEFAULT '[]'", "security_analysis_errors"),
+        ]:
+            try:
+                await conn.execute(f"ALTER TABLE scans ADD COLUMN {column_def}")
+            except aiosqlite.OperationalError:
+                pass  # Column already exists
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS findings (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,

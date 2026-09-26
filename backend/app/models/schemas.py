@@ -5,6 +5,7 @@ class ScanRequest(BaseModel):
     target_url: HttpUrl = Field(..., example="https://example-ai-app.com")
     authorize: bool = False  # Explicit authorization for real tool scans
     simulate: bool = True  # If True, use simulation mode regardless of tool availability
+    scan_timeout_seconds: int = 300  # Max wall-clock time for the full scan workflow
 
 class Finding(BaseModel):
     agent_name: str

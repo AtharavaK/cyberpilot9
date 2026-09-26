@@ -4,7 +4,7 @@ Used by the Recon Agent to discover open ports, services, and hosts.
 """
 import asyncio
 import xml.etree.ElementTree as ET
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 from app.services.tools.base import BaseScanner, ScanResult, ScanStatus
 
 
@@ -22,27 +22,30 @@ class NmapScanner(BaseScanner):
     async def scan(self, target: str, **kwargs) -> ScanResult:
         """
         Run Nmap scan against target.
-        
+
         Args:
             target: Target URL or IP address
             scan_type: Type of scan (syn, connect, udp, comprehensive)
             ports: Port range to scan (e.g., "1-1000", "top100")
             extra_args: Additional nmap arguments
-            
+            allow_internal: If True, allow scanning private/internal IPs.
+                When False (default), private/internal targets are rejected
+                to prevent accidental SSRF-like abuse against internal networks.
+            scan_coordinate: optional dict recorded for audit (who authorized this scan).
+
         Returns:
             ScanResult with discovered hosts, ports, and services
         """
         import time
         start_time = time.time()
-        
+
         # Check if nmap is installed
         if not await self.check_installed():
             return self.create_not_installed_result()
-        
-        # Extract target host from URL
-        host = self._extract_host(target)
-        if not host:
-            return self.create_failed_result("Could not extract host from target")
+
+        # Extract target host and validate
+        allow_internal = kwargs.get("allow_internal", False)
+        host, is_private = self._classify_host(target, allow_internal)
         
         # Build nmap command
         args = [self.command_name]
@@ -120,6 +123,20 @@ class NmapScanner(BaseScanner):
         except Exception:
             # Assume it's already a hostname/IP
             return target.split(":")[0]
+
+    @staticmethod
+    def _classify_host(target: str, allow_internal: bool) -> Tuple[str, bool]:
+        """Validate target and return (host, is_private). Raises on blocked targets."""
+        from app.services.target_validation import classify_target
+        host, is_private, _resolved = classify_target(target)
+        if is_private and not allow_internal:
+            raise ValueError(
+                f"Scanning private/internal targets is not allowed by default. "
+                f"Target {host!r} resolves to a private or internal address. "
+                f"Set allow_internal=True only when you have explicit authorization "
+                f"to scan this network."
+            )
+        return (host, is_private)
     
     def _parse_xml_output(self, xml_output: str) -> List[Dict[str, Any]]:
         """Parse Nmap XML output into findings."""

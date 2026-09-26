@@ -5,7 +5,7 @@ Used by the API Security Agent to find API vulnerabilities.
 import asyncio
 import json
 import aiohttp
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from app.services.tools.base import BaseScanner, ScanResult, ScanStatus
 
 
@@ -41,19 +41,26 @@ class ZapScanner(BaseScanner):
     async def scan(self, target: str, **kwargs) -> ScanResult:
         """
         Run ZAP scan against target API.
-        
+
         Args:
             target: Target API URL
             scan_type: Type of scan (quick, full, auth)
             context: ZAP context name
             extra_args: Additional ZAP arguments
-            
+            allow_internal: If True, allow scanning private/internal IPs.
+                When False (default), private/internal targets are rejected
+                to prevent accidental SSRF-like abuse against internal networks.
+
         Returns:
             ScanResult with API security findings
         """
         import time
         start_time = time.time()
-        
+
+        # Validate target — reject private/internal hosts by default
+        allow_internal = kwargs.get("allow_internal", False)
+        host, is_private = self._classify_host(target, allow_internal)
+
         # Check if ZAP is running
         if not await self.check_installed():
             return self.create_not_installed_result()
@@ -308,8 +315,22 @@ class ZapScanner(BaseScanner):
     async def scan_api(self, target: str) -> ScanResult:
         """Quick API security scan."""
         return await self._quick_scan(target, {})
-    
+
     async def scan_with_auth(self, target: str, auth_config: Dict) -> ScanResult:
         """Scan with authentication (requires ZAP context setup)."""
         # Placeholder for authenticated scans
         return await self._full_scan(target, {})
+
+    @staticmethod
+    def _classify_host(target: str, allow_internal: bool) -> Tuple[str, bool]:
+        """Validate target and return (host, is_private). Raises on blocked targets."""
+        from app.services.target_validation import classify_target
+        host, is_private, _resolved = classify_target(target)
+        if is_private and not allow_internal:
+            raise ValueError(
+                f"Scanning private/internal targets is not allowed by default. "
+                f"Target {host!r} resolves to a private or internal address. "
+                f"Set allow_internal=True only when you have explicit authorization "
+                f"to scan this network."
+            )
+        return (host, is_private)

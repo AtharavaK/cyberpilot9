@@ -36,11 +36,11 @@ async function handleResponse(res) {
  * @param {string} targetUrl
  * @returns {Promise<{scan_id: string, status: string, message: string}>}
  */
-export async function startScan(targetUrl, simulate = true) {
+export async function startScan(targetUrl, simulate = true, authorize = false, scanTimeoutSeconds = 300) {
   const res = await fetch(`${getBaseUrl()}/scan/start`, {
     method: 'POST',
     headers: getHeaders(),
-    body: JSON.stringify({ target_url: targetUrl, simulate }),
+    body: JSON.stringify({ target_url: targetUrl, simulate, authorize, scan_timeout_seconds: scanTimeoutSeconds }),
   });
   return handleResponse(res);
 }

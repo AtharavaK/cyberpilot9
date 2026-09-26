@@ -20,14 +20,15 @@ export default function SettingsPanel() {
   });
 
   // Auto-save API key to localStorage as soon as it changes
+  // Only persist non-empty keys; never clobber a stored key with empty input
   useEffect(() => {
     if (apiKey) {
       localStorage.setItem('cyberpilot_api_key', apiKey);
       setApiKeySaved(true);
-    } else {
-      localStorage.removeItem('cyberpilot_api_key');
-      setApiKeySaved(false);
     }
+    // If input is empty but we have a stored key, leave the stored key alone —
+    // the user may have cleared the field to type a new one. We only clear
+    // localStorage when the user explicitly hits "Reset to Defaults".
   }, [apiKey]);
   const [saveStatus, setSaveStatus] = useState(null); // 'saving', 'success', 'error'
   const [testStatus, setTestStatus] = useState(null); // 'testing', 'success', 'error'
@@ -50,7 +51,14 @@ export default function SettingsPanel() {
     setSaveStatus('saving');
     try {
       localStorage.setItem('cyberpilot_api_url', apiUrl);
-      localStorage.setItem('cyberpilot_api_key', apiKey);
+      // Only persist API key if non-empty; an empty field does not erase a
+      // previously stored key (the user may be mid-typing). Clear only via Reset.
+      const storedKey = localStorage.getItem('cyberpilot_api_key');
+      if (apiKey) {
+        localStorage.setItem('cyberpilot_api_key', apiKey);
+      } else if (!storedKey) {
+        localStorage.removeItem('cyberpilot_api_key');
+      }
       localStorage.setItem('cyberpilot_scan_timeout', scanTimeout.toString());
       localStorage.setItem('cyberpilot_theme', theme);
       // Apply theme immediately

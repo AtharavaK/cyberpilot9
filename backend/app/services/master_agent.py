@@ -3,7 +3,7 @@ import asyncio
 import json
 import os
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from langgraph.graph import StateGraph, END
 from app.services.graph_state import CyberPilotState, Finding, ComplianceFinding
 from app.db import crud
@@ -113,7 +113,10 @@ async def recon_node(state: CyberPilotState) -> CyberPilotState:
     nmap_errors = []
     try:
         tool_manager = ToolManager()
-        nmap_result = await tool_manager.run_agent_tools("Recon Agent", state["target_url"])
+        nmap_result = await tool_manager.run_agent_tools(
+            "Recon Agent", state["target_url"],
+            allow_internal=state.get("authorize", False),
+        )
         nmap_findings = [f for f in nmap_result.get("findings", []) if f.get("metadata", {}).get("tool") == "nmap"]
         for f in nmap_findings:
             meta = f.get("metadata", {})
@@ -199,25 +202,37 @@ async def security_analysis_node(state: CyberPilotState) -> CyberPilotState:
     # Run all security analysis agents in parallel
     try:
         # AI Security Agent
-        ai_result = await tool_manager.run_agent_tools("AI Security Agent", target)
+        ai_result = await tool_manager.run_agent_tools(
+            "AI Security Agent", target,
+            allow_internal=state.get("authorize", False),
+        )
         state["ai_vulnerabilities"] = ai_result.get("findings", [])
         for f in state["ai_vulnerabilities"]:
             f["agent_name"] = "AI Security Agent"
 
         # API Security Agent
-        api_result = await tool_manager.run_agent_tools("API Security Agent", target)
+        api_result = await tool_manager.run_agent_tools(
+            "API Security Agent", target,
+            allow_internal=state.get("authorize", False),
+        )
         state["api_vulnerabilities"] = api_result.get("findings", [])
         for f in state["api_vulnerabilities"]:
             f["agent_name"] = "API Security Agent"
 
         # Code Review Agent
-        code_result = await tool_manager.run_agent_tools("Code Review Agent", target)
+        code_result = await tool_manager.run_agent_tools(
+            "Code Review Agent", target,
+            allow_internal=state.get("authorize", False),
+        )
         state["code_vulnerabilities"] = code_result.get("findings", [])
         for f in state["code_vulnerabilities"]:
             f["agent_name"] = "Code Review Agent"
 
         # Infrastructure Agent
-        infra_result = await tool_manager.run_agent_tools("Infrastructure Agent", target)
+        infra_result = await tool_manager.run_agent_tools(
+            "Infrastructure Agent", target,
+            allow_internal=state.get("authorize", False),
+        )
         state["infra_vulnerabilities"] = infra_result.get("findings", [])
         for f in state["infra_vulnerabilities"]:
             f["agent_name"] = "Infrastructure Agent"
@@ -329,6 +344,31 @@ COMPLIANCE_MAPPING = {
     },
 }
 
+_CWE_COMPLIANCE: Dict[str, Dict[str, List[str]]] = {
+    "79": {"owasp_llm": ["LLM01: Prompt Injection"], "nist_csf": ["PR.AC-7", "DE.CM-1"]},
+    "89": {"owasp_llm": ["LLM05: Supply Chain Vulnerabilities"], "nist_csf": ["PR.IP-1"]},
+    "200": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["DE.AE-1"]},
+    "201": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["PR.DS-1"]},
+    "264": {"owasp_llm": ["LLM09: Overreliance"], "nist_csf": ["PR.AC-3"]},
+    "269": {"owasp_llm": ["LLM09: Overreliance"], "nist_csf": ["PR.AC-3"]},
+    "287": {"owasp_llm": ["LLM01: Prompt Injection"], "nist_csf": ["PR.AC-7"]},
+    "295": {"owasp_llm": ["LLM01: Prompt Injection"], "nist_csf": ["PR.AC-7"]},
+    "310": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["PR.DS-1"]},
+    "311": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["PR.DS-1"]},
+    "319": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["PR.DS-1"]},
+    "327": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["PR.DS-1"]},
+    "434": {"owasp_llm": ["LLM05: Supply Chain Vulnerabilities"], "nist_csf": ["PR.DS-1"]},
+    "502": {"owasp_llm": ["LLM05: Supply Chain Vulnerabilities"], "nist_csf": ["PR.DS-1"]},
+    "532": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["DE.AE-1"]},
+    "611": {"owasp_llm": ["LLM01: Prompt Injection"], "nist_csf": ["PR.AC-7"]},
+    "732": {"owasp_llm": ["LLM09: Overreliance"], "nist_csf": ["PR.AC-3"]},
+    "749": {"owasp_llm": ["LLM01: Prompt Injection"], "nist_csf": ["PR.IP-1"]},
+    "798": {"owasp_llm": ["LLM05: Supply Chain Vulnerabilities"], "nist_csf": ["PR.AC-7"]},
+    "862": {"owasp_llm": ["LLM09: Overreliance"], "nist_csf": ["PR.AC-3"]},
+    "863": {"owasp_llm": ["LLM09: Overreliance"], "nist_csf": ["PR.AC-3"]},
+    "918": {"owasp_llm": ["LLM01: Prompt Injection"], "nist_csf": ["PR.AC-7"]},
+}
+
 
 async def compliance_node(state: CyberPilotState) -> CyberPilotState:
     print(f"[{state['scan_id']}] Running Compliance Agent...")
@@ -339,13 +379,50 @@ async def compliance_node(state: CyberPilotState) -> CyberPilotState:
     compliance_findings: List[ComplianceFinding] = []
     for finding in state["all_findings"]:
         agent = finding["agent_name"]
-        mapping = COMPLIANCE_MAPPING.get(agent, {"owasp_llm": [], "nist_csf": []})
+        metadata = finding.get("metadata") or {}
+        owasp_llm: Optional[List[str]] = None
+        nist_csf: Optional[List[str]] = None
+
+        # 1. If the finding carries explicit OWASP LLM tags, use them.
+        explicit_owasp = metadata.get("owasp", [])
+        if isinstance(explicit_owasp, list) and explicit_owasp:
+            owasp_llm = explicit_owasp
+        else:
+            # 2. If the finding carries a CWE id, map it.
+            cwe_ids = metadata.get("cwe", [])
+            if isinstance(cwe_ids, list) and cwe_ids:
+                owasp_llm = []
+                nist_csf = []
+                for cwe in cwe_ids:
+                    cwe_str = str(cwe).split("-")[0].strip()  # "CWE-79" -> "79"
+                    if cwe_str in _CWE_COMPLIANCE:
+                        entry = _CWE_COMPLIANCE[cwe_str]
+                        owasp_llm.extend(entry["owasp_llm"])
+                        nist_csf.extend(entry["nist_csf"])
+                if owasp_llm:
+                    owasp_llm = list(dict.fromkeys(owasp_llm))
+                    nist_csf = list(dict.fromkeys(nist_csf))
+                else:
+                    owasp_llm = None
+                    nist_csf = None
+            else:
+                owasp_llm = None
+                nist_csf = None
+
+        # 3. Fall back to the static agent-level mapping when no finding-specific data.
+        if owasp_llm is None or nist_csf is None:
+            mapping = COMPLIANCE_MAPPING.get(agent, {"owasp_llm": [], "nist_csf": []})
+            if owasp_llm is None:
+                owasp_llm = mapping["owasp_llm"]
+            if nist_csf is None:
+                nist_csf = mapping["nist_csf"]
+
         compliance_findings.append({
             "finding_id": 0,  # Will be updated after findings are persisted
             "agent_name": agent,
             "severity": finding["severity"],
-            "owasp_llm": mapping["owasp_llm"],
-            "nist_csf": mapping["nist_csf"],
+            "owasp_llm": owasp_llm,
+            "nist_csf": nist_csf,
         })
 
     state["compliance_findings"] = compliance_findings
@@ -358,13 +435,22 @@ async def recommendation_node(state: CyberPilotState) -> CyberPilotState:
     await asyncio.sleep(1)
     state["status"] = "RECOMMENDATIONS"
 
+    # Agent-level guidance to append when the tool did not provide specific remediation.
+    # These are general best-practice notes — they never replace a tool's specific text.
+    agent_defaults: Dict[str, str] = {
+        "AI Security Agent": "Implement input sanitization and strict system prompts.",
+        "API Security Agent": "Use Redis-based rate limiting (e.g., 60 req/min per IP).",
+        "Code Review Agent": "Update dependencies to their latest secure versions and review code patterns.",
+        "Infrastructure Agent": "Review exposed services and close unnecessary ports.",
+        "Recon Agent": "Verify that discovered services and ports are intentional and properly secured.",
+    }
+
     for finding in state["all_findings"]:
-        if finding["agent_name"] == "AI Security Agent":
-            finding["remediation"] = "Implement input sanitization and strict system prompts."
-        elif finding["agent_name"] == "API Security Agent":
-            finding["remediation"] = "Use Redis-based rate limiting (e.g., 60 req/min per IP)."
-        elif finding["agent_name"] == "Code Review Agent":
-            finding["remediation"] = "Update 'requests' library to the latest secure version."
+        existing = (finding.get("remediation") or "").strip()
+        # Only fill in a default when the tool left remediation empty.
+        # Never overwrite a tool-provided remediation with a generic note.
+        if not existing and finding.get("agent_name") in agent_defaults:
+            finding["remediation"] = agent_defaults[finding["agent_name"]]
 
     await crud.update_scan_status(state["scan_id"], state["status"])
     return state
@@ -450,7 +536,12 @@ master_agent_app = build_master_agent_graph()
 # API Integration Functions
 # ---------------------------------------------------------
 
-async def start_scan_workflow(target_url: str, data_source: str = "real_tools", authorize: bool = False) -> str:
+async def start_scan_workflow(
+    target_url: str,
+    data_source: str = "real_tools",
+    authorize: bool = False,
+    scan_timeout_seconds: int = 300,
+) -> str:
     scan_id = str(uuid.uuid4())
     target_url_str = str(target_url)
 
@@ -461,6 +552,7 @@ async def start_scan_workflow(target_url: str, data_source: str = "real_tools", 
     # Create initial record in SQLite
     await crud.create_scan(scan_id, target_url_str, data_source)
 
+    # Store the timeout on the state so nodes can short-circuit if breached.
     initial_state: CyberPilotState = {
         "scan_id": scan_id,
         "target_url": target_url_str,
@@ -478,8 +570,22 @@ async def start_scan_workflow(target_url: str, data_source: str = "real_tools", 
         "security_analysis_errors": [],
         "final_report": {},
         "data_source": "real_tools",  # Updated by analysis node based on tool results
+        "authorize": authorize,     # Explicit user authorization for real scans
+        "_scan_started_at": datetime.utcnow().timestamp(),
+        "_scan_timeout_seconds": scan_timeout_seconds,
     }
 
+    async def _watchdog():
+        await asyncio.sleep(scan_timeout_seconds)
+        try:
+            result = await crud.get_scan(scan_id)
+        except Exception:
+            return
+        if result and result.get("status") not in ("COMPLETED", "FAILED", "TIMEOUT"):
+            await crud.update_scan_status(scan_id, "TIMEOUT")
+            await crud.update_scan_error(scan_id, f"Scan timed out after {scan_timeout_seconds}s")
+
+    asyncio.create_task(_watchdog())
     asyncio.create_task(master_agent_app.ainvoke(initial_state))
     return scan_id
 

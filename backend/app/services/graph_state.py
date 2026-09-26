@@ -18,7 +18,7 @@ class CyberPilotState(TypedDict):
     scan_id: str
     target_url: str
     status: str
-    
+
     # Internal agent states
     recon_data: Dict[str, Any]
     recon_findings: List[Finding]
@@ -26,15 +26,20 @@ class CyberPilotState(TypedDict):
     api_vulnerabilities: List[Finding]
     code_vulnerabilities: List[Finding]
     infra_vulnerabilities: List[Finding]
-    
+
     # Aggregated results
     all_findings: List[Finding]
     overall_score: int
     compliance_status: str
     compliance_findings: List[ComplianceFinding]
     security_analysis_errors: List[str]
-    
+
     # Final output
     final_report: Dict[str, Any]
     # Honesty tracking
     data_source: str  # "real_tools" | "simulation" | "partial"
+    # User authorization for real/internal scans
+    authorize: bool
+    # Internal workflow bookkeeping (prefixed with _ to signal "not part of the report schema")
+    _scan_started_at: float
+    _scan_timeout_seconds: int

@@ -27,6 +27,9 @@ export default function App() {
   const [scanResult, setScanResult] = useState(null);
   const [scanError, setScanError] = useState(null);
   const [apiReachable, setApiReachable] = useState(true);
+  const [scanTimeout, setScanTimeout] = useState(() => {
+    return parseInt(localStorage.getItem('cyberpilot_scan_timeout') || '300', 10);
+  });
 
   const pollRef = useRef(null);
 
@@ -67,15 +70,15 @@ export default function App() {
     return () => stopPolling();
   }, [scanId, isScanning]);
 
-  const handleScanStart = async (url) => {
+  const handleScanStart = async (url, simulate = true, authorize = false) => {
     setScanError(null);
     setScanResult(null);
     setScanStatus(null);
     setIsScanning(true);
     try {
-      const res = await startScan(url);
+      const res = await startScan(url, simulate, authorize, scanTimeout);
       setScanId(res.scan_id);
-      setScanStatus('INITIALIZING');
+      setScanStatus(res.status === 'ACCEPTED' ? 'INITIALIZING' : res.status);
       setApiReachable(true);
     } catch (err) {
       if (err.status === 401) {
@@ -140,7 +143,7 @@ export default function App() {
         {activeTab === 'dashboard' && (
           <div>
             {/* Scan Form */}
-            <ScanForm onScanStart={handleScanStart} isScanning={isScanning} />
+            <ScanForm onScanStart={handleScanStart} isScanning={isScanning} scanTimeout={scanTimeout} />
 
             {/* Error Banner */}
             {scanError && (
