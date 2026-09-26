@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>CyberPilot Executive Summary - {{ scan_id[:8] }}</title>
+    <style>
+        @page {
+            size: A4;
+            margin: 2cm;
+        }
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+            line-height: 1.6;
+            color: #1f2937;
+            background: white;
+        }
+        .header {
+            text-align: center;
+            border-bottom: 3px solid #00f0ff;
+            padding-bottom: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        .header h1 {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #0f111a;
+            margin: 0 0 0.5rem;
+        }
+        .header .subtitle {
+            color: #64748b;
+            font-size: 1.1rem;
+        }
+        .meta-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .meta-card {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 1rem;
+        }
+        .meta-card .label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #64748b;
+            font-weight: 600;
+        }
+        .meta-card .value {
+            font-size: 1rem;
+            font-weight: 500;
+            color: #1f2937;
+            margin-top: 0.25rem;
+            word-break: break-all;
+        }
+        .score-section {
+            display: flex;
+            align-items: center;
+            gap: 2rem;
+            padding: 2rem;
+            background: linear-gradient(135deg, #f0fdfa 0%, #ecfdf5 100%);
+            border-radius: 12px;
+            border: 1px solid #a7f3d0;
+            margin-bottom: 2rem;
+        }
+        .score-circle {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: white;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+        }
+        .score-circle .score {
+            font-size: 2.5rem;
+            font-weight: 700;
+        }
+        .score-circle .max-score {
+            font-size: 1rem;
+            color: #64748b;
+        }
+        .risk-badge {
+            display: inline-block;
+            padding: 0.5rem 1.5rem;
+            border-radius: 999px;
+            font-weight: 700;
+            font-size: 1.1rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .stat-card {
+            text-align: center;
+            padding: 1.25rem;
+            border-radius: 10px;
+            border: 1px solid #e2e8f0;
+        }
+        .stat-card.high { border-color: #fecaca; background: #fef2f2; }
+        .stat-card.medium { border-color: #fed7aa; background: #fffbeb; }
+        .stat-card.low { border-color: #bbf7d0; background: #f0fdf4; }
+        .stat-card.total { border-color: #bfdbfe; background: #eff6ff; }
+        .stat-card .number {
+            font-size: 2rem;
+            font-weight: 700;
+            line-height: 1;
+        }
+        .stat-card.high .number { color: #dc2626; }
+        .stat-card.medium .number { color: #ea580c; }
+        .stat-card.low .number { color: #16a34a; }
+        .stat-card.total .number { color: #2563eb; }
+        .stat-card .label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            color: #64748b;
+            margin-top: 0.5rem;
+        }
+        .section {
+            margin-bottom: 2rem;
+        }
+        .section-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #1f2937;
+            border-bottom: 2px solid #e2e8f0;
+            padding-bottom: 0.5rem;
+            margin-bottom: 1rem;
+        }
+        .finding-item {
+            padding: 1rem;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            margin-bottom: 0.75rem;
+            background: white;
+        }
+        .finding-item.high { border-left: 4px solid #ef4444; }
+        .finding-item.medium { border-left: 4px solid #f59e0b; }
+        .finding-item.low { border-left: 4px solid #10b981; }
+        .finding-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 0.5rem;
+        }
+        .finding-title {
+            font-weight: 600;
+            color: #1f2937;
+        }
+        .severity-badge {
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 0.25rem 0.75rem;
+            border-radius: 999px;
+            text-transform: uppercase;
+        }
+        .severity-badge.high { background: #fee2e2; color: #dc2626; }
+        .severity-badge.medium { background: #ffedd5; color: #ea580c; }
+        .severity-badge.low { background: #dcfce7; color: #16a34a; }
+        .finding-agent {
+            font-size: 0.85rem;
+            color: #64748b;
+            margin-bottom: 0.5rem;
+        }
+        .finding-remediation {
+            font-size: 0.9rem;
+            color: #374151;
+            background: #f9fafb;
+            padding: 0.75rem;
+            border-radius: 6px;
+            border: 1px solid #e5e7eb;
+        }
+        .finding-remediation strong {
+            color: #1f2937;
+        }
+        .footer {
+            margin-top: 3rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid #e2e8f0;
+            text-align: center;
+            color: #64748b;
+            font-size: 0.85rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>CyberPilot Security Assessment</h1>
+        <p class="subtitle">Executive Summary Report</p>
+    </div>
+
+    <div class="meta-grid">
+        <div class="meta-card">
+            <div class="label">Scan ID</div>
+            <div class="value">{{ scan_id }}</div>
+        </div>
+        <div class="meta-card">
+            <div class="label">Target Application</div>
+            <div class="value">{{ target_url }}</div>
+        </div>
+        <div class="meta-card">
+            <div class="label">Assessment Date</div>
+            <div class="value">{{ scan_date }}</div>
+        </div>
+        <div class="meta-card">
+            <div class="label">Overall Security Score</div>
+            <div class="value">{{ overall_score }}/100</div>
+        </div>
+    </div>
+
+    <div class="score-section">
+        <div class="score-circle">
+            <span class="score" style="color: {{ risk_color }}">{{ overall_score }}</span>
+            <span class="max-score">/100</span>
+        </div>
+        <div>
+            <span class="risk-badge" style="background: {{ risk_color }}20; color: {{ risk_color }}">
+                {{ risk_level }} Risk
+            </span>
+            <p style="margin-top: 1rem; color: #64748b;">
+                This score reflects the aggregate risk posture based on identified vulnerabilities across AI, API, code, and infrastructure layers.
+            </p>
+        </div>
+    </div>
+
+    <div class="stats-grid">
+        <div class="stat-card high">
+            <div class="number">{{ high_count }}</div>
+            <div class="label">High Severity</div>
+        </div>
+        <div class="stat-card medium">
+            <div class="number">{{ medium_count }}</div>
+            <div class="label">Medium Severity</div>
+        </div>
+        <div class="stat-card low">
+            <div class="number">{{ low_count }}</div>
+            <div class="label">Low Severity</div>
+        </div>
+        <div class="stat-card total">
+            <div class="number">{{ total_findings }}</div>
+            <div class="label">Total Findings</div>
+        </div>
+    </div>
+
+    {% if top_risks %}
+    <div class="section">
+        <h2 class="section-title">Top Priority Risks</h2>
+        {% for finding in top_risks %}
+        <div class="finding-item {{ finding.severity.lower() }}">
+            <div class="finding-header">
+                <span class="finding-title">{{ finding.description }}</span>
+                <span class="severity-badge {{ finding.severity.lower() }}">{{ finding.severity }}</span>
+            </div>
+            <div class="finding-agent">{{ finding.agent_name }}</div>
+            <div class="finding-remediation">
+                <strong>Remediation:</strong> {{ finding.remediation or 'No specific remediation provided.' }}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    <div class="section">
+        <h2 class="section-title">Compliance Overview</h2>
+        <p style="color: #64748b; margin-bottom: 1rem;">
+            {{ compliance_count }} compliance mappings generated across OWASP LLM Top 10 and NIST Cybersecurity Framework.
+        </p>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+            <div style="background: #f0fdfa; border: 1px solid #a7f3d0; border-radius: 8px; padding: 1rem;">
+                <div style="font-weight: 600; color: #065f46; margin-bottom: 0.5rem;">OWASP LLM Top 10</div>
+                <div style="font-size: 0.9rem; color: #047857;">Mapped categories include: LLM01 (Prompt Injection), LLM04 (Model DoS), LLM05 (Supply Chain), LLM09 (Overreliance), LLM10 (Model Theft)</div>
+            </div>
+            <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 1rem;">
+                <div style="font-weight: 600; color: #1e40af; margin-bottom: 0.5rem;">NIST CSF</div>
+                <div style="font-size: 0.9rem; color: #1d4ed8;">Mapped functions: Identify (ID.RA-1), Protect (PR.AC-7, PR.DS-1, PR.DS-6, PR.IP-1), Detect (DE.AE-1, DE.CM-1)</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="footer">
+        <p>Generated by CyberPilot Autonomous Multi-Agent AI Security Assessment Platform</p>
+        <p>Report ID: {{ scan_id }} | {{ scan_date }}</p>
+    </div>
+</body>
+</html>

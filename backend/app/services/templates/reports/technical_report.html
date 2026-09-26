@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>CyberPilot Technical Report - {{ scan_id[:8] }}</title>
+    <style>
+        @page {
+            size: A4;
+            margin: 2cm;
+        }
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+            line-height: 1.6;
+            color: #1f2937;
+            background: white;
+            font-size: 12px;
+        }
+        .header {
+            text-align: center;
+            border-bottom: 3px solid #00f0ff;
+            padding-bottom: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        .header h1 {
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: #0f111a;
+            margin: 0 0 0.5rem;
+        }
+        .header .subtitle {
+            color: #64748b;
+            font-size: 1rem;
+        }
+        .meta-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .meta-card {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 1rem;
+        }
+        .meta-card .label {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #64748b;
+            font-weight: 600;
+        }
+        .meta-card .value {
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: #1f2937;
+            margin-top: 0.25rem;
+            word-break: break-all;
+        }
+        .score-section {
+            display: flex;
+            align-items: center;
+            gap: 1.5rem;
+            padding: 1.5rem;
+            background: linear-gradient(135deg, #f0fdfa 0%, #ecfdf5 100%);
+            border-radius: 10px;
+            border: 1px solid #a7f3d0;
+            margin-bottom: 2rem;
+        }
+        .score-circle {
+            width: 100px;
+            height: 100px;
+            border-radius: 50%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: white;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+        }
+        .score-circle .score {
+            font-size: 2rem;
+            font-weight: 700;
+        }
+        .risk-badge {
+            display: inline-block;
+            padding: 0.4rem 1rem;
+            border-radius: 999px;
+            font-weight: 700;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .section {
+            margin-bottom: 1.5rem;
+            page-break-inside: avoid;
+        }
+        .section-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #1f2937;
+            border-bottom: 2px solid #e2e8f0;
+            padding-bottom: 0.4rem;
+            margin-bottom: 1rem;
+        }
+        .subsection-title {
+            font-size: 1rem;
+            font-weight: 600;
+            color: #374151;
+            margin: 1rem 0 0.5rem;
+            padding-left: 0.75rem;
+            border-left: 3px solid #00f0ff;
+        }
+        .finding-item {
+            padding: 1rem;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            margin-bottom: 0.75rem;
+            background: white;
+            page-break-inside: avoid;
+        }
+        .finding-item.high { border-left: 4px solid #ef4444; }
+        .finding-item.medium { border-left: 4px solid #f59e0b; }
+        .finding-item.low { border-left: 4px solid #10b981; }
+        .finding-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 0.5rem;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+        .finding-title {
+            font-weight: 600;
+            color: #1f2937;
+            font-size: 0.95rem;
+        }
+        .severity-badge {
+            font-size: 0.65rem;
+            font-weight: 700;
+            padding: 0.2rem 0.6rem;
+            border-radius: 999px;
+            text-transform: uppercase;
+        }
+        .severity-badge.high { background: #fee2e2; color: #dc2626; }
+        .severity-badge.medium { background: #ffedd5; color: #ea580c; }
+        .severity-badge.low { background: #dcfce7; color: #16a34a; }
+        .finding-meta {
+            display: flex;
+            gap: 1rem;
+            font-size: 0.8rem;
+            color: #64748b;
+            margin-bottom: 0.5rem;
+            flex-wrap: wrap;
+        }
+        .finding-remediation {
+            font-size: 0.85rem;
+            color: #374151;
+            background: #f9fafb;
+            padding: 0.75rem;
+            border-radius: 6px;
+            border: 1px solid #e5e7eb;
+        }
+        .finding-remediation strong {
+            color: #1f2937;
+        }
+        .compliance-mapping {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            padding: 0.75rem;
+            margin-top: 0.5rem;
+            font-size: 0.8rem;
+        }
+        .compliance-mapping strong {
+            color: #374151;
+        }
+        .compliance-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.35rem;
+            margin-top: 0.35rem;
+        }
+        .compliance-tag {
+            font-size: 0.7rem;
+            padding: 0.15rem 0.5rem;
+            border-radius: 4px;
+            font-weight: 500;
+        }
+        .compliance-tag.owasp { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
+        .compliance-tag.nist { background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; }
+        .recon-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 1rem;
+        }
+        .recon-card {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 1rem;
+        }
+        .recon-card .label {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            color: #64748b;
+            font-weight: 600;
+        }
+        .recon-card .value {
+            font-size: 0.95rem;
+            font-weight: 500;
+            color: #1f2937;
+            margin-top: 0.25rem;
+        }
+        .footer {
+            margin-top: 3rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid #e2e8f0;
+            text-align: center;
+            color: #64748b;
+            font-size: 0.8rem;
+        }
+        .toc {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        .toc h3 {
+            margin: 0 0 1rem;
+            font-size: 1rem;
+        }
+        .toc ul {
+            margin: 0;
+            padding-left: 1.5rem;
+            columns: 2;
+        }
+        .toc li {
+            margin: 0.35rem 0;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>CyberPilot Security Assessment</h1>
+        <p class="subtitle">Technical Vulnerability Report</p>
+    </div>
+
+    <div class="meta-grid">
+        <div class="meta-card">
+            <div class="label">Scan ID</div>
+            <div class="value">{{ scan_id }}</div>
+        </div>
+        <div class="meta-card">
+            <div class="label">Target Application</div>
+            <div class="value">{{ target_url }}</div>
+        </div>
+        <div class="meta-card">
+            <div class="label">Assessment Date</div>
+            <div class="value">{{ scan_date }}</div>
+        </div>
+        <div class="meta-card">
+            <div class="label">Overall Security Score</div>
+            <div class="value">{{ overall_score }}/100</div>
+        </div>
+    </div>
+
+    <div class="score-section">
+        <div class="score-circle">
+            <span class="score">{{ overall_score }}</span>
+            <span style="font-size: 0.75rem; color: #64748b;">/100</span>
+        </div>
+        <div>
+            <span class="risk-badge" style="background: {% if overall_score >= 80 %}#dcfce7; color: #16a34a{% elif overall_score >= 60 %}#ffedd5; color: #ea580c{% else %}#fee2e2; color: #dc2626{% endif %}">
+                {% if overall_score >= 80 %}Low Risk{% elif overall_score >= 60 %}Medium Risk{% else %}High Risk{% endif %}
+            </span>
+        </div>
+    </div>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li>1. Reconnaissance Summary</li>
+            <li>2. Detailed Findings by Agent</li>
+            {% for agent in findings_by_agent.keys() %}
+            <li>&nbsp;&nbsp;2.{{ loop.index }} {{ agent }}</li>
+            {% endfor %}
+            <li>3. Compliance Mappings</li>
+            {% for agent in compliance_by_agent.keys() %}
+            <li>&nbsp;&nbsp;3.{{ loop.index }} {{ agent }}</li>
+            {% endfor %}
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2 class="section-title">1. Reconnaissance Summary</h2>
+        <div class="recon-grid">
+            <div class="recon-card">
+                <div class="label">Endpoints Discovered</div>
+                <div class="value">{{ recon_data.endpoints_found or 'N/A' }}</div>
+            </div>
+            <div class="recon-card">
+                <div class="label">Authentication Method</div>
+                <div class="value">{{ recon_data.auth_type or 'N/A' }}</div>
+            </div>
+        </div>
+        <p style="margin-top: 1rem; color: #64748b; font-size: 0.9rem;">
+            The reconnaissance phase identified the above attack surface characteristics. Further enumeration was performed by specialized agents during the security analysis phase.
+        </p>
+    </div>
+
+    <div class="section">
+        <h2 class="section-title">2. Detailed Findings by Agent</h2>
+        
+        {% for agent_name, agent_findings in findings_by_agent.items() %}
+        <div class="subsection-title">{{ agent_name }}</div>
+        
+        {% for finding in agent_findings %}
+        <div class="finding-item {{ finding.severity.lower() }}">
+            <div class="finding-header">
+                <span class="finding-title">{{ finding.description }}</span>
+                <span class="severity-badge {{ finding.severity.lower() }}">{{ finding.severity }}</span>
+            </div>
+            <div class="finding-meta">
+                <span><strong>Agent:</strong> {{ finding.agent_name }}</span>
+                <span><strong>Severity:</strong> {{ finding.severity }}</span>
+            </div>
+            <div class="finding-remediation">
+                <strong>Remediation:</strong> {{ finding.remediation or 'No specific remediation provided.' }}
+            </div>
+            
+            {% if compliance_by_agent.get(finding.agent_name) %}
+            <div class="compliance-mapping">
+                <strong>Compliance Mappings:</strong>
+                <div class="compliance-tags">
+                    {% for c in compliance_by_agent[finding.agent_name] %}
+                        {% for owasp in c.owasp_llm %}
+                        <span class="compliance-tag owasp">{{ owasp }}</span>
+                        {% endfor %}
+                        {% for nist in c.nist_csf %}
+                        <span class="compliance-tag nist">{{ nist }}</span>
+                        {% endfor %}
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+        </div>
+        {% endfor %}
+        {% endfor %}
+    </div>
+
+    <div class="section">
+        <h2 class="section-title">3. Compliance Mappings</h2>
+        
+        {% for agent_name, agent_compliance in compliance_by_agent.items() %}
+        <div class="subsection-title">{{ agent_name }}</div>
+        
+        {% for c in agent_compliance %}
+        <div class="finding-item {{ c.severity.lower() }}" style="border-left-color: #00f0ff;">
+            <div class="finding-meta">
+                <span><strong>Severity:</strong> {{ c.severity }}</span>
+            </div>
+            <div class="compliance-tags">
+                {% for owasp in c.owasp_llm %}
+                <span class="compliance-tag owasp">{{ owasp }}</span>
+                {% endfor %}
+                {% for nist in c.nist_csf %}
+                <span class="compliance-tag nist">{{ nist }}</span>
+                {% endfor %}
+            </div>
+        </div>
+        {% endfor %}
+        {% endfor %}
+    </div>
+
+    <div class="footer">
+        <p>Generated by CyberPilot Autonomous Multi-Agent AI Security Assessment Platform</p>
+        <p>Report ID: {{ scan_id }} | {{ scan_date }}</p>
+    </div>
+</body>
+</html>
