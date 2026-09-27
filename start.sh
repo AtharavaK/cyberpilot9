@@ -19,11 +19,30 @@ fi
 echo "[CyberPilot] Starting backend on port ${APP_PORT:-8000}..."
 echo "[CyberPilot] Frontend will proxy to backend at ${VITE_API_PROXY_TARGET:-http://localhost:8000}"
 
+# Ensure backend venv exists and deps are installed (WSL/Linux)
+if ! ls "$BACKEND_DIR/.venv/bin/python" >/dev/null 2>&1 && ! ls "$BACKEND_DIR/venv/bin/python" >/dev/null 2>&1; then
+    echo "[CyberPilot] Backend venv not found. Creating with uv..."
+    cd "$BACKEND_DIR"
+    if command -v uv >/dev/null 2>&1; then
+        uv venv --python python3 .venv 2>/dev/null || uv venv .venv 2>/dev/null || true
+    fi
+    if ls .venv/bin/python >/dev/null 2>&1; then
+        .venv/bin/python -m pip install -r requirements.txt 2>/dev/null || true
+    fi
+fi
+
 # Start backend
 cd "$BACKEND_DIR"
-source venv_linux/bin/activate 2>/dev/null || source venv/bin/activate 2>/dev/null || true
-uvicorn app.main:app --host 0.0.0.0 --port "${APP_PORT:-8000}" &
-BACKEND_PID=$!
+if ls .venv/bin/python >/dev/null 2>&1; then
+    .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port "${APP_PORT:-8000}" &
+elif command -v uv >/dev/null 2>&1 && ls .venv/bin/python >/dev/null 2>&1; then
+    .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port "${APP_PORT:-8000}" &
+else
+    echo "[CyberPilot] WARNING: No backend Python venv found. Install deps first:"
+    echo "  cd backend && uv venv && .venv/bin/python -m pip install -r requirements.txt"
+    echo "Starting without backend..."
+    BACKEND_PID=""
+fi
 
 # Give backend a moment to start
 sleep 2
