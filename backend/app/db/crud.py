@@ -117,12 +117,17 @@ async def get_scan(scan_id: str) -> Optional[Dict[str, Any]]:
             d["nist_csf"] = json.loads(d["nist_csf"])
             scan["compliance"].append(d)
 
-        # Add final_report if available
+        # Parse JSON fields
         if scan.get("final_report"):
             try:
                 scan["final_report"] = json.loads(scan["final_report"])
             except (json.JSONDecodeError, TypeError):
                 scan["final_report"] = {}
+        if scan.get("security_analysis_errors"):
+            try:
+                scan["security_analysis_errors"] = json.loads(scan["security_analysis_errors"])
+            except (json.JSONDecodeError, TypeError):
+                scan["security_analysis_errors"] = []
 
         return scan
 
