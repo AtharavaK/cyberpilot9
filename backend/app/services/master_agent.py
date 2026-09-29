@@ -5,10 +5,10 @@ import os
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from langgraph.graph import StateGraph, END
-from app.services.graph_state import CyberPilotState, Finding, ComplianceFinding
+from app.services.graph_state import CyberPilotState, ComplianceFinding
 from app.db import crud
 from app.services import report_generator
-from app.services.tool_manager import ToolManager, run_recon, run_ai_security, run_api_security, run_code_review, run_infrastructure
+from app.services.tool_manager import ToolManager
 from urllib.parse import urlparse
 import aiohttp
 
@@ -17,15 +17,43 @@ def calculate_risk_score(findings: List[Dict[str, Any]]) -> int:
     """Calculate overall risk score based on findings severity."""
     if not findings:
         return 100
-    
+
     severity_weights = {"HIGH": 25, "MEDIUM": 10, "LOW": 3}
     total_penalty = sum(severity_weights.get(f.get("severity", "LOW"), 3) for f in findings)
     score = max(0, 100 - total_penalty)
     return score
 
-# ---------------------------------------------------------
-# Node Functions (Real Tool Execution) — writing to SQLite
-# ---------------------------------------------------------
+
+# ── Event helpers ──────────────────────────────────────────────────────────────
+
+async def _emit(scan_id: str, event_type: str, payload: Dict[str, Any]) -> None:
+    """Write a progress/event row to scan_events table."""
+    try:
+        await crud.add_scan_event(scan_id, event_type, payload)
+    except Exception as e:
+        print(f"[{scan_id}] WARNING: failed to emit event: {e}")
+
+
+async def _check_interrupt(scan_id: str) -> bool:
+    """Return True if scan should stop (cancelled). Return False if paused (awaited)."""
+    cancelled = await crud.is_scan_cancelled(scan_id)
+    if cancelled:
+        return True
+    paused = await crud.is_scan_paused(scan_id)
+    if paused:
+        # Wait until resumed — poll every 2 seconds
+        while True:
+            await asyncio.sleep(2)
+            cancelled = await crud.is_scan_cancelled(scan_id)
+            if cancelled:
+                return True
+            paused = await crud.is_scan_paused(scan_id)
+            if not paused:
+                break
+    return False
+
+
+# ── HTTP Recon Helper ──────────────────────────────────────────────────────────
 
 async def _http_recon(target_url: str) -> Dict[str, Any]:
     """Probe a URL target for API endpoints, headers, tech stack, and auth hints."""
@@ -69,13 +97,11 @@ async def _http_recon(target_url: str) -> Dict[str, Any]:
                                 result["auth_type"] = "HTTP Basic Auth"
                             else:
                                 result["auth_type"] = "Token/Auth Required (unspecified)"
-                    # Collect headers from the root response
                     if path == "/":
                         for h in headers_to_check:
                             val = resp.headers.get(h)
                             if val:
                                 result["headers"][h] = val
-                                # Tech detection from headers
                                 lower = val.lower()
                                 if "nginx" in lower: result["tech_stack"].append("Nginx")
                                 elif "apache" in lower: result["tech_stack"].append("Apache")
@@ -91,15 +117,19 @@ async def _http_recon(target_url: str) -> Dict[str, Any]:
     return result
 
 
+# ── Node Functions ─────────────────────────────────────────────────────────────
+
 async def recon_node(state: CyberPilotState) -> CyberPilotState:
     print(f"[{state['scan_id']}] Running Recon Agent...")
     state["status"] = "RECONNAISSANCE"
     await crud.update_scan_status(state["scan_id"], state["status"])
+    await crud.update_scan_session(state["scan_id"], "RECONNAISSANCE", "recon")
+    await _emit(state["scan_id"], "phase", {"phase": "RECONNAISSANCE", "message": "Starting reconnaissance..."})
 
     parsed = urlparse(state["target_url"])
     is_ip_target = not parsed.scheme or not parsed.netloc
 
-    # 1. HTTP probing (primary for URL targets)
+    # 1. HTTP probing
     http_result = {}
     if not is_ip_target:
         try:
@@ -108,14 +138,21 @@ async def recon_node(state: CyberPilotState) -> CyberPilotState:
             http_result = {"errors": [str(e)]}
             print(f"[{state['scan_id']}] HTTP recon failed: {e}")
 
-    # 2. Nmap port scan (supplementary, for network-level recon)
+    await _emit(state["scan_id"], "progress", {
+        "message": f"Probed {len(http_result.get('endpoints', []))} HTTP endpoints",
+        "endpoints_found": len(http_result.get("endpoints", [])),
+    })
+
+    # 2. Nmap port scan
     nmap_endpoints = []
     nmap_errors = []
     try:
         tool_manager = ToolManager()
+        nmap_config = state.get("nmap_config", {})
         nmap_result = await tool_manager.run_agent_tools(
             "Recon Agent", state["target_url"],
             allow_internal=state.get("authorize", False),
+            **nmap_config,
         )
         nmap_findings = [f for f in nmap_result.get("findings", []) if f.get("metadata", {}).get("tool") == "nmap"]
         for f in nmap_findings:
@@ -123,31 +160,34 @@ async def recon_node(state: CyberPilotState) -> CyberPilotState:
             if meta.get("raw_type") == "open_port":
                 nmap_endpoints.append({
                     "type": "network_port",
-                    "port": meta.get("line"),
+                    "port": meta.get("port", meta.get("line", 0)),
                     "protocol": meta.get("raw_type", "").replace("open_", ""),
-                    "service": meta.get("metadata", {}).get("service", {}),
+                    "service": meta.get("service", {}),
                 })
         nmap_errors = nmap_result.get("errors", [])
     except Exception as e:
         nmap_errors.append(str(e))
 
+    await _emit(state["scan_id"], "progress", {
+        "message": f"Nmap found {len(nmap_endpoints)} open ports",
+        "ports_found": len(nmap_endpoints),
+    })
+
     # Build recon data
     endpoints = http_result.get("endpoints", [])
-    # Add network port findings as supplementary info (not as API endpoints)
     for pe in nmap_endpoints:
         endpoints.append(pe)
 
     auth_type = http_result.get("auth_type", "Unknown")
-    # If Nmap found an HTTP service on a port, note it
     if nmap_endpoints and auth_type == "Unknown":
         for pe in nmap_endpoints:
             svc = pe.get("service", {})
             svc_name = svc.get("name", "").lower()
             if "http" in svc_name or "https" in svc_name:
-                auth_type = "Unknown (HTTP service detected on port " + str(pe["port"]) + ")"
+                auth_type = f"Unknown (HTTP service detected on port {pe['port']})"
 
     state["recon_data"] = {
-        "endpoints_found": len([e for e in endpoints if e.get("path")]),  # Only count HTTP endpoints
+        "endpoints_found": len([e for e in endpoints if e.get("path")]),
         "endpoints": endpoints,
         "auth_type": auth_type,
         "headers": http_result.get("headers", {}),
@@ -158,7 +198,7 @@ async def recon_node(state: CyberPilotState) -> CyberPilotState:
         "errors": http_result.get("errors", []) + nmap_errors,
     }
 
-    # Recon findings: report open ports as INFO-level findings, report auth type
+    # Recon findings
     recon_findings = []
     for pe in nmap_endpoints:
         recon_findings.append({
@@ -187,21 +227,29 @@ async def recon_node(state: CyberPilotState) -> CyberPilotState:
         })
 
     state["recon_findings"] = recon_findings
+    await _emit(state["scan_id"], "finding_batch", {
+        "agent": "Recon Agent",
+        "count": len(recon_findings),
+        "message": f"Found {len(recon_findings)} recon findings",
+    })
 
     await crud.update_scan_status(state["scan_id"], state["status"])
     return state
+
 
 async def security_analysis_node(state: CyberPilotState) -> CyberPilotState:
     print(f"[{state['scan_id']}] Running Security Analysis Agents...")
     state["status"] = "SECURITY_ANALYSIS"
     await crud.update_scan_status(state["scan_id"], state["status"])
+    await crud.update_scan_session(state["scan_id"], "SECURITY_ANALYSIS", "security_analysis")
+    await _emit(state["scan_id"], "phase", {"phase": "SECURITY_ANALYSIS", "message": "Running security analysis agents..."})
 
     tool_manager = ToolManager()
     target = state["target_url"]
 
-    # Run all security analysis agents in parallel
     try:
         # AI Security Agent
+        await _emit(state["scan_id"], "progress", {"message": "Running AI Security Agent..."})
         ai_result = await tool_manager.run_agent_tools(
             "AI Security Agent", target,
             allow_internal=state.get("authorize", False),
@@ -209,8 +257,13 @@ async def security_analysis_node(state: CyberPilotState) -> CyberPilotState:
         state["ai_vulnerabilities"] = ai_result.get("findings", [])
         for f in state["ai_vulnerabilities"]:
             f["agent_name"] = "AI Security Agent"
+        await _emit(state["scan_id"], "finding_batch", {
+            "agent": "AI Security Agent",
+            "count": len(state["ai_vulnerabilities"]),
+        })
 
         # API Security Agent
+        await _emit(state["scan_id"], "progress", {"message": "Running API Security Agent..."})
         api_result = await tool_manager.run_agent_tools(
             "API Security Agent", target,
             allow_internal=state.get("authorize", False),
@@ -218,8 +271,13 @@ async def security_analysis_node(state: CyberPilotState) -> CyberPilotState:
         state["api_vulnerabilities"] = api_result.get("findings", [])
         for f in state["api_vulnerabilities"]:
             f["agent_name"] = "API Security Agent"
+        await _emit(state["scan_id"], "finding_batch", {
+            "agent": "API Security Agent",
+            "count": len(state["api_vulnerabilities"]),
+        })
 
         # Code Review Agent
+        await _emit(state["scan_id"], "progress", {"message": "Running Code Review Agent..."})
         code_result = await tool_manager.run_agent_tools(
             "Code Review Agent", target,
             allow_internal=state.get("authorize", False),
@@ -227,8 +285,13 @@ async def security_analysis_node(state: CyberPilotState) -> CyberPilotState:
         state["code_vulnerabilities"] = code_result.get("findings", [])
         for f in state["code_vulnerabilities"]:
             f["agent_name"] = "Code Review Agent"
+        await _emit(state["scan_id"], "finding_batch", {
+            "agent": "Code Review Agent",
+            "count": len(state["code_vulnerabilities"]),
+        })
 
         # Infrastructure Agent
+        await _emit(state["scan_id"], "progress", {"message": "Running Infrastructure Agent..."})
         infra_result = await tool_manager.run_agent_tools(
             "Infrastructure Agent", target,
             allow_internal=state.get("authorize", False),
@@ -236,12 +299,14 @@ async def security_analysis_node(state: CyberPilotState) -> CyberPilotState:
         state["infra_vulnerabilities"] = infra_result.get("findings", [])
         for f in state["infra_vulnerabilities"]:
             f["agent_name"] = "Infrastructure Agent"
+        await _emit(state["scan_id"], "finding_batch", {
+            "agent": "Infrastructure Agent",
+            "count": len(state["infra_vulnerabilities"]),
+        })
 
-        # Collect all errors
         all_errors = []
         for result in [ai_result, api_result, code_result, infra_result]:
             all_errors.extend(result.get("errors", []))
-
         state["security_analysis_errors"] = all_errors
 
     except Exception as e:
@@ -252,22 +317,21 @@ async def security_analysis_node(state: CyberPilotState) -> CyberPilotState:
         state["infra_vulnerabilities"] = []
         state["security_analysis_errors"] = [str(e)]
 
-    # Determine data source for honesty tracking
+    # Determine data source
+    recon_had_findings = bool(state.get("recon_findings", []))
     tools_returned_findings = any([
         state["ai_vulnerabilities"],
         state["api_vulnerabilities"],
         state["code_vulnerabilities"],
         state["infra_vulnerabilities"],
-    ])
-    tools_had_errors = bool(all_errors)
-    
+    ]) or recon_had_findings
+    tools_had_errors = bool(state.get("security_analysis_errors", []))
+
     if tools_returned_findings and not tools_had_errors:
         state["data_source"] = "real_tools"
     elif tools_returned_findings and tools_had_errors:
         state["data_source"] = "partial"
     else:
-        # No tools returned findings and no errors — all tools were unavailable.
-        # Mark as simulation and inject baseline findings so the scan is still useful.
         state["data_source"] = "simulation"
         print(f"[{state['scan_id']}] WARNING: No security tools available. Using baseline simulation findings.")
         state["ai_vulnerabilities"] = [{
@@ -275,26 +339,26 @@ async def security_analysis_node(state: CyberPilotState) -> CyberPilotState:
             "severity": "HIGH",
             "description": "Mild susceptibility to role-play jailbreak (simulation — no LLM endpoint reachable).",
             "remediation": "Implement input sanitization and strict system prompts. Connect an LLM endpoint to test against a real model.",
-            "metadata": {"tool": "ai_tester", "simulated": True}
+            "metadata": {"tool": "ai_tester", "simulated": True},
         }]
         state["api_vulnerabilities"] = [{
             "agent_name": "API Security Agent",
             "severity": "HIGH",
-            "description": f"Rate limiting missing on /api/v1/chat endpoint (simulation — no scanner reachable).",
+            "description": "Rate limiting missing on /api/v1/chat endpoint (simulation — no scanner reachable).",
             "remediation": "Use Redis-based rate limiting (e.g., 60 req/min per IP). Connect OWASP ZAP to scan a real target.",
-            "metadata": {"tool": "zap", "simulated": True}
+            "metadata": {"tool": "zap", "simulated": True},
         }]
         state["code_vulnerabilities"] = [{
             "agent_name": "Code Review Agent",
             "severity": "MEDIUM",
             "description": "Outdated dependency (requests v2.25.0) detected (simulation — no scanner reachable).",
             "remediation": "Update 'requests' library to the latest secure version. Connect Semgrep/Bandit/Gitleaks to scan real code.",
-            "metadata": {"tool": "semgrep", "simulated": True}
+            "metadata": {"tool": "semgrep", "simulated": True},
         }]
         state["infra_vulnerabilities"] = []
         state["security_analysis_errors"] = [
             "No security tools were available to run a real assessment. Results are simulated for demonstration.",
-            "To run a real assessment, ensure at least one of these is reachable: Ollama (localhost:11434), OWASP ZAP (localhost:8080), nmap, semgrep, bandit, gitleaks, trivy."
+            "To run a real assessment, ensure at least one of these is reachable: Ollama (localhost:11434), OWASP ZAP (localhost:8080), nmap, semgrep, bandit, gitleaks, trivy.",
         ]
 
     state["all_findings"] = (
@@ -303,28 +367,38 @@ async def security_analysis_node(state: CyberPilotState) -> CyberPilotState:
         state["code_vulnerabilities"] +
         state["infra_vulnerabilities"]
     )
-
-    # Add recon findings if any
     if state.get("recon_findings"):
         state["all_findings"] = state["recon_findings"] + state["all_findings"]
 
+    total = len(state["all_findings"])
+    await _emit(state["scan_id"], "progress", {
+        "message": f"Security analysis complete. Total findings: {total}",
+        "total_findings": total,
+    })
+
     await crud.update_scan_status(state["scan_id"], state["status"])
     return state
+
 
 async def risk_scoring_node(state: CyberPilotState) -> CyberPilotState:
     print(f"[{state['scan_id']}] Running Risk Analysis Agent...")
     await asyncio.sleep(0.5)
     state["status"] = "RISK_SCORING"
+    await crud.update_scan_status(state["scan_id"], state["status"])
+    await crud.update_scan_session(state["scan_id"], "RISK_SCORING", "risk_scoring")
+    await _emit(state["scan_id"], "phase", {"phase": "RISK_SCORING", "message": "Calculating risk score..."})
+
     state["overall_score"] = calculate_risk_score(state["all_findings"])
+    await _emit(state["scan_id"], "progress", {
+        "message": f"Risk score: {state['overall_score']}/100",
+        "overall_score": state["overall_score"],
+    })
     await crud.update_scan_status(state["scan_id"], state["status"])
     return state
 
 
-# ---------------------------------------------------------
-# Compliance Mapping
-# ---------------------------------------------------------
+# ── Compliance Mapping ─────────────────────────────────────────────────────────
 
-# Mapping of agent findings to OWASP LLM Top 10 and NIST CSF
 COMPLIANCE_MAPPING = {
     "AI Security Agent": {
         "owasp_llm": ["LLM01: Prompt Injection", "LLM02: Insecure Output Handling"],
@@ -342,31 +416,35 @@ COMPLIANCE_MAPPING = {
         "owasp_llm": ["LLM09: Overreliance", "LLM10: Model Theft"],
         "nist_csf": ["PR.DS-1", "PR.AC-3", "PR.PT-4"],
     },
+    "Recon Agent": {
+        "owasp_llm": ["LLM03: Training Data Poisoning", "LLM09: Overreliance"],
+        "nist_csf": ["ID.RA-1", "PR.DS-1", "PR.AC-3"],
+    },
 }
 
 _CWE_COMPLIANCE: Dict[str, Dict[str, List[str]]] = {
-    "79": {"owasp_llm": ["LLM01: Prompt Injection"], "nist_csf": ["PR.AC-7", "DE.CM-1"]},
-    "89": {"owasp_llm": ["LLM05: Supply Chain Vulnerabilities"], "nist_csf": ["PR.IP-1"]},
-    "200": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["DE.AE-1"]},
-    "201": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["PR.DS-1"]},
-    "264": {"owasp_llm": ["LLM09: Overreliance"], "nist_csf": ["PR.AC-3"]},
-    "269": {"owasp_llm": ["LLM09: Overreliance"], "nist_csf": ["PR.AC-3"]},
-    "287": {"owasp_llm": ["LLM01: Prompt Injection"], "nist_csf": ["PR.AC-7"]},
-    "295": {"owasp_llm": ["LLM01: Prompt Injection"], "nist_csf": ["PR.AC-7"]},
-    "310": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["PR.DS-1"]},
-    "311": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["PR.DS-1"]},
-    "319": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["PR.DS-1"]},
-    "327": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["PR.DS-1"]},
+    "79":  {"owasp_llm": ["LLM01: Prompt Injection"],          "nist_csf": ["PR.AC-7", "DE.CM-1"]},
+    "89":  {"owasp_llm": ["LLM05: Supply Chain Vulnerabilities"], "nist_csf": ["PR.IP-1"]},
+    "200": {"owasp_llm": ["LLM02: Insecure Output Handling"],  "nist_csf": ["DE.AE-1"]},
+    "201": {"owasp_llm": ["LLM02: Insecure Output Handling"],  "nist_csf": ["PR.DS-1"]},
+    "264": {"owasp_llm": ["LLM09: Overreliance"],              "nist_csf": ["PR.AC-3"]},
+    "269": {"owasp_llm": ["LLM09: Overreliance"],              "nist_csf": ["PR.AC-3"]},
+    "287": {"owasp_llm": ["LLM01: Prompt Injection"],          "nist_csf": ["PR.AC-7"]},
+    "295": {"owasp_llm": ["LLM01: Prompt Injection"],          "nist_csf": ["PR.AC-7"]},
+    "310": {"owasp_llm": ["LLM02: Insecure Output Handling"],  "nist_csf": ["PR.DS-1"]},
+    "311": {"owasp_llm": ["LLM02: Insecure Output Handling"],  "nist_csf": ["PR.DS-1"]},
+    "319": {"owasp_llm": ["LLM02: Insecure Output Handling"],  "nist_csf": ["PR.DS-1"]},
+    "327": {"owasp_llm": ["LLM02: Insecure Output Handling"],  "nist_csf": ["PR.DS-1"]},
     "434": {"owasp_llm": ["LLM05: Supply Chain Vulnerabilities"], "nist_csf": ["PR.DS-1"]},
     "502": {"owasp_llm": ["LLM05: Supply Chain Vulnerabilities"], "nist_csf": ["PR.DS-1"]},
-    "532": {"owasp_llm": ["LLM02: Insecure Output Handling"], "nist_csf": ["DE.AE-1"]},
-    "611": {"owasp_llm": ["LLM01: Prompt Injection"], "nist_csf": ["PR.AC-7"]},
-    "732": {"owasp_llm": ["LLM09: Overreliance"], "nist_csf": ["PR.AC-3"]},
-    "749": {"owasp_llm": ["LLM01: Prompt Injection"], "nist_csf": ["PR.IP-1"]},
+    "532": {"owasp_llm": ["LLM02: Insecure Output Handling"],  "nist_csf": ["DE.AE-1"]},
+    "611": {"owasp_llm": ["LLM01: Prompt Injection"],          "nist_csf": ["PR.AC-7"]},
+    "732": {"owasp_llm": ["LLM09: Overreliance"],              "nist_csf": ["PR.AC-3"]},
+    "749": {"owasp_llm": ["LLM01: Prompt Injection"],          "nist_csf": ["PR.IP-1"]},
     "798": {"owasp_llm": ["LLM05: Supply Chain Vulnerabilities"], "nist_csf": ["PR.AC-7"]},
-    "862": {"owasp_llm": ["LLM09: Overreliance"], "nist_csf": ["PR.AC-3"]},
-    "863": {"owasp_llm": ["LLM09: Overreliance"], "nist_csf": ["PR.AC-3"]},
-    "918": {"owasp_llm": ["LLM01: Prompt Injection"], "nist_csf": ["PR.AC-7"]},
+    "862": {"owasp_llm": ["LLM09: Overreliance"],              "nist_csf": ["PR.AC-3"]},
+    "863": {"owasp_llm": ["LLM09: Overreliance"],              "nist_csf": ["PR.AC-3"]},
+    "918": {"owasp_llm": ["LLM01: Prompt Injection"],          "nist_csf": ["PR.AC-7"]},
 }
 
 
@@ -375,6 +453,9 @@ async def compliance_node(state: CyberPilotState) -> CyberPilotState:
     await asyncio.sleep(0.5)
     state["status"] = "COMPLIANCE_MAPPING"
     state["compliance_status"] = "MAPPING"
+    await crud.update_scan_status(state["scan_id"], state["status"])
+    await crud.update_scan_session(state["scan_id"], "COMPLIANCE_MAPPING", "compliance")
+    await _emit(state["scan_id"], "phase", {"phase": "COMPLIANCE_MAPPING", "message": "Mapping findings to compliance frameworks..."})
 
     compliance_findings: List[ComplianceFinding] = []
     for finding in state["all_findings"]:
@@ -383,18 +464,16 @@ async def compliance_node(state: CyberPilotState) -> CyberPilotState:
         owasp_llm: Optional[List[str]] = None
         nist_csf: Optional[List[str]] = None
 
-        # 1. If the finding carries explicit OWASP LLM tags, use them.
         explicit_owasp = metadata.get("owasp", [])
         if isinstance(explicit_owasp, list) and explicit_owasp:
             owasp_llm = explicit_owasp
         else:
-            # 2. If the finding carries a CWE id, map it.
             cwe_ids = metadata.get("cwe", [])
             if isinstance(cwe_ids, list) and cwe_ids:
                 owasp_llm = []
                 nist_csf = []
                 for cwe in cwe_ids:
-                    cwe_str = str(cwe).split("-")[0].strip()  # "CWE-79" -> "79"
+                    cwe_str = str(cwe).split("-")[0].strip()
                     if cwe_str in _CWE_COMPLIANCE:
                         entry = _CWE_COMPLIANCE[cwe_str]
                         owasp_llm.extend(entry["owasp_llm"])
@@ -409,7 +488,6 @@ async def compliance_node(state: CyberPilotState) -> CyberPilotState:
                 owasp_llm = None
                 nist_csf = None
 
-        # 3. Fall back to the static agent-level mapping when no finding-specific data.
         if owasp_llm is None or nist_csf is None:
             mapping = COMPLIANCE_MAPPING.get(agent, {"owasp_llm": [], "nist_csf": []})
             if owasp_llm is None:
@@ -418,7 +496,7 @@ async def compliance_node(state: CyberPilotState) -> CyberPilotState:
                 nist_csf = mapping["nist_csf"]
 
         compliance_findings.append({
-            "finding_id": 0,  # Will be updated after findings are persisted
+            "finding_id": 0,
             "agent_name": agent,
             "severity": finding["severity"],
             "owasp_llm": owasp_llm,
@@ -426,6 +504,10 @@ async def compliance_node(state: CyberPilotState) -> CyberPilotState:
         })
 
     state["compliance_findings"] = compliance_findings
+    await _emit(state["scan_id"], "progress", {
+        "message": f"Mapped {len(compliance_findings)} findings to compliance frameworks",
+        "compliance_count": len(compliance_findings),
+    })
     await crud.update_scan_status(state["scan_id"], state["status"])
     return state
 
@@ -434,9 +516,10 @@ async def recommendation_node(state: CyberPilotState) -> CyberPilotState:
     print(f"[{state['scan_id']}] Running Recommendation Agent...")
     await asyncio.sleep(1)
     state["status"] = "RECOMMENDATIONS"
+    await crud.update_scan_status(state["scan_id"], state["status"])
+    await crud.update_scan_session(state["scan_id"], "RECOMMENDATIONS", "recommendations")
+    await _emit(state["scan_id"], "phase", {"phase": "RECOMMENDATIONS", "message": "Generating remediation recommendations..."})
 
-    # Agent-level guidance to append when the tool did not provide specific remediation.
-    # These are general best-practice notes — they never replace a tool's specific text.
     agent_defaults: Dict[str, str] = {
         "AI Security Agent": "Implement input sanitization and strict system prompts.",
         "API Security Agent": "Use Redis-based rate limiting (e.g., 60 req/min per IP).",
@@ -447,34 +530,41 @@ async def recommendation_node(state: CyberPilotState) -> CyberPilotState:
 
     for finding in state["all_findings"]:
         existing = (finding.get("remediation") or "").strip()
-        # Only fill in a default when the tool left remediation empty.
-        # Never overwrite a tool-provided remediation with a generic note.
         if not existing and finding.get("agent_name") in agent_defaults:
             finding["remediation"] = agent_defaults[finding["agent_name"]]
 
+    await _emit(state["scan_id"], "progress", {
+        "message": "Recommendations generated for all findings",
+    })
     await crud.update_scan_status(state["scan_id"], state["status"])
     return state
+
 
 async def report_node(state: CyberPilotState) -> CyberPilotState:
     print(f"[{state['scan_id']}] Running Report Agent...")
     await asyncio.sleep(0.5)
     state["status"] = "COMPLETED"
+    await crud.update_scan_status(state["scan_id"], state["status"])
+    await crud.update_scan_session(state["scan_id"], "COMPLETED", "report")
+    await _emit(state["scan_id"], "phase", {"phase": "COMPLETED", "message": "Generating reports..."})
 
-    # Persist final results to SQLite
-    finding_ids = await crud.complete_scan(state["scan_id"], state["overall_score"], state["all_findings"], state.get("data_source", "real_tools"))
+    # Persist final results
+    finding_ids = await crud.complete_scan(state["scan_id"], state["overall_score"],
+                                           state["all_findings"], state.get("data_source", "real_tools"))
 
-    # Update compliance findings with actual finding IDs
     if state.get("compliance_findings"):
         for idx, cf in enumerate(state["compliance_findings"]):
             if idx < len(finding_ids):
                 cf["finding_id"] = finding_ids[idx]
         await crud.save_compliance_findings(state["scan_id"], state["compliance_findings"], finding_ids)
 
+    # Generate structured remediation details for each finding
+    remediation_details = _build_remediation_details(state["all_findings"])
+
     # Generate PDF reports
     output_dir = os.path.join(os.path.dirname(__file__), "..", "..", "output", "reports")
     output_dir = os.path.abspath(output_dir)
 
-    # Prepare scan data for report generation
     scan_data = {
         "scan_id": state["scan_id"],
         "target_url": state["target_url"],
@@ -502,14 +592,149 @@ async def report_node(state: CyberPilotState) -> CyberPilotState:
             "error": str(e),
         }
 
-    # Save final_report to database
+    # Save final_report + remediation details
     await crud.update_final_report(state["scan_id"], state["final_report"])
+
+    await _emit(state["scan_id"], "progress", {
+        "message": "Scan complete",
+        "overall_score": state["overall_score"],
+        "total_findings": len(state["all_findings"]),
+    })
+    await _emit(state["scan_id"], "completed", {
+        "overall_score": state["overall_score"],
+        "total_findings": len(state["all_findings"]),
+        "data_source": state.get("data_source", "real_tools"),
+    })
 
     return state
 
-# ---------------------------------------------------------
-# Graph Construction
-# ---------------------------------------------------------
+
+def _build_remediation_details(findings: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    """Build structured remediation guidance for each finding (by index in findings list)."""
+    details = {}
+    for idx, f in enumerate(findings):
+        agent = f.get("agent_name", "Unknown")
+        severity = f.get("severity", "LOW")
+        desc = f.get("description", "")
+
+        steps = _generate_steps(agent, severity, desc, f)
+        references = _generate_references(agent, severity, desc, f)
+
+        details[idx] = {
+            "finding_id": idx,
+            "steps": steps,
+            "references": references,
+        }
+    return details
+
+
+def _generate_steps(agent: str, severity: str, description: str,
+                    finding: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Generate structured remediation steps for a finding."""
+    steps = []
+    step_num = 1
+
+    # Step 1: Understand the issue
+    steps.append({
+        "step": step_num,
+        "title": "Understand the finding",
+        "description": f"Review the finding from {agent}: {description[:120]}{'...' if len(description) > 120 else ''}",
+    })
+    step_num += 1
+
+    # Step 2: Locate in codebase / infrastructure
+    metadata = finding.get("metadata", {}) or {}
+    file_loc = metadata.get("file", "")
+    if file_loc:
+        steps.append({
+            "step": step_num,
+            "title": "Locate the issue",
+            "description": f"Open {file_loc} in your code editor to review the problematic code.",
+            "command": f"code {file_loc}",
+        })
+        step_num += 1
+
+    # Step 3: General fix guidance based on agent
+    fix_guidance = {
+        "AI Security Agent": (
+            "Review your LLM system prompts for injection vulnerabilities. "
+            "Add input sanitization, output filtering, and strict delimiter usage. "
+            "Consider implementing a separate validation layer before passing user input to the model."
+        ),
+        "API Security Agent": (
+            "Review the API endpoint for missing authentication, rate limiting, or input validation. "
+            "Add proper auth checks, implement rate limiting (e.g., 60 req/min per IP via Redis), "
+            "and validate all inputs against expected schemas."
+        ),
+        "Code Review Agent": (
+            "Review the flagged code pattern. Apply secure coding practices: "
+            "use parameterized queries instead of string concatenation, "
+            "avoid eval/exec, sanitize file paths, and update outdated dependencies."
+        ),
+        "Infrastructure Agent": (
+            "Review the exposed service or configuration. "
+            "Close unnecessary ports, update to latest secure versions, "
+            "remove default credentials, and apply least-privilege principles."
+        ),
+        "Recon Agent": (
+            "Verify whether the discovered service, port, or endpoint is intentional. "
+            "If not, close it or restrict access. If yes, ensure it's properly secured "
+            "with authentication and up-to-date software."
+        ),
+    }
+
+    guidance = fix_guidance.get(agent, "Review the finding and apply appropriate security controls.")
+    steps.append({
+        "step": step_num,
+        "title": "Apply the fix",
+        "description": guidance,
+    })
+    step_num += 1
+
+    # Step 4: Verify
+    steps.append({
+        "step": step_num,
+        "title": "Verify the fix",
+        "description": "Run the scan again to confirm the finding is resolved. Use the 'mark as remediated' triage action to track progress.",
+        "command": "Re-run scan and check findings tab",
+    })
+
+    return steps
+
+
+def _generate_references(agent: str, severity: str, description: str,
+                         finding: Dict[str, Any]) -> List[str]:
+    """Generate reference URLs for a finding."""
+    refs = []
+    metadata = finding.get("metadata", {}) or {}
+    cwe_ids = metadata.get("cwe", [])
+    if isinstance(cwe_ids, list):
+        for cwe in cwe_ids:
+            cwe_str = str(cwe).split("-")[-1].strip()
+            if cwe_str.isdigit():
+                refs.append(f"https://cwe.mitre.org/data/definitions/{cwe_str}.html")
+
+    owasp_ids = metadata.get("owasp", [])
+    if isinstance(owasp_ids, list):
+        for owasp in owasp_ids:
+            refs.append(f"https://owasp.org/www-project-{owasp.lower().replace(' ', '-')}/")
+
+    # Agent-specific reference
+    agent_refs = {
+        "AI Security Agent": "https://owasp.org/www-project-top-10-for-large-language-model-applications/",
+        "API Security Agent": "https://owasp.org/www-project-api-security/",
+        "Code Review Agent": "https://semgrep.dev/docs/",
+        "Infrastructure Agent": "https://cisecurity.org/cis-benchmarks/",
+        "Recon Agent": "https://nmap.org/book/man.html",
+    }
+    ref = agent_refs.get(agent)
+    if ref and ref not in refs:
+        refs.append(ref)
+
+    return refs
+
+
+# ── Graph Construction ─────────────────────────────────────────────────────────
 
 def build_master_agent_graph() -> StateGraph:
     workflow = StateGraph(CyberPilotState)
@@ -530,29 +755,32 @@ def build_master_agent_graph() -> StateGraph:
 
     return workflow.compile()
 
+
 master_agent_app = build_master_agent_graph()
 
-# ---------------------------------------------------------
-# API Integration Functions
-# ---------------------------------------------------------
+
+# ── API Integration Functions ──────────────────────────────────────────────────
 
 async def start_scan_workflow(
     target_url: str,
     data_source: str = "real_tools",
     authorize: bool = False,
     scan_timeout_seconds: int = 300,
+    nmap_config: Dict[str, Any] = None,
+    session_id: str = "",
 ) -> str:
     scan_id = str(uuid.uuid4())
     target_url_str = str(target_url)
 
-    # Authorization gate: require explicit authorization for real scans
     if data_source == "real_tools" and not authorize:
         raise ValueError("Real tool scans require explicit authorization (pass authorize=True)")
 
-    # Create initial record in SQLite
-    await crud.create_scan(scan_id, target_url_str, data_source)
+    # Create session record (for pause/resume/cancel tracking)
+    await crud.create_scan_session(scan_id)
 
-    # Store the timeout on the state so nodes can short-circuit if breached.
+    # Create initial scan record
+    await crud.create_scan(scan_id, target_url_str, data_source, session_id=session_id)
+
     initial_state: CyberPilotState = {
         "scan_id": scan_id,
         "target_url": target_url_str,
@@ -569,8 +797,9 @@ async def start_scan_workflow(
         "compliance_findings": [],
         "security_analysis_errors": [],
         "final_report": {},
-        "data_source": "real_tools",  # Updated by analysis node based on tool results
-        "authorize": authorize,     # Explicit user authorization for real scans
+        "data_source": "real_tools",
+        "authorize": authorize,
+        "nmap_config": nmap_config or {},
         "_scan_started_at": datetime.utcnow().timestamp(),
         "_scan_timeout_seconds": scan_timeout_seconds,
     }
@@ -581,17 +810,24 @@ async def start_scan_workflow(
             result = await crud.get_scan(scan_id)
         except Exception:
             return
-        if result and result.get("status") not in ("COMPLETED", "FAILED", "TIMEOUT"):
+        if result and result.get("status") not in ("COMPLETED", "FAILED", "TIMEOUT", "CANCELLED"):
             await crud.update_scan_status(scan_id, "TIMEOUT")
+            await crud.update_scan_session(scan_id, "TIMEOUT", "watchdog")
             await crud.update_scan_error(scan_id, f"Scan timed out after {scan_timeout_seconds}s")
+            await _emit(scan_id, "error", {"message": f"Scan timed out after {scan_timeout_seconds}s"})
 
     asyncio.create_task(_watchdog())
     asyncio.create_task(master_agent_app.ainvoke(initial_state))
     return scan_id
 
+
 async def get_scan_result(scan_id: str) -> Dict[str, Any]:
-    """Read directly from SQLite."""
+    """Read directly from SQLite. Merges DB findings into all_findings for API compatibility."""
     result = await crud.get_scan(scan_id)
     if result is None:
         return {"status": "NOT_FOUND"}
+    # crud.get_scan returns "findings" (list of DB rows).
+    # Put them into "all_findings" so the remediation endpoint and any
+    # downstream consumers see the same structure as the in-memory state.
+    result["all_findings"] = result.get("findings", [])
     return result

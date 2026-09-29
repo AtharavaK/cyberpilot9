@@ -33,6 +33,7 @@ export default function SettingsPanel() {
   const [saveStatus, setSaveStatus] = useState(null); // 'saving', 'success', 'error'
   const [testStatus, setTestStatus] = useState(null); // 'testing', 'success', 'error'
   const [testMessage, setTestMessage] = useState('');
+  const [resetStatus, setResetStatus] = useState(null); // null, 'success'
   
   // Apply theme on mount and when it changes
   useEffect(() => {
@@ -97,6 +98,8 @@ export default function SettingsPanel() {
     localStorage.removeItem('cyberpilot_api_key');
     localStorage.removeItem('cyberpilot_scan_timeout');
     localStorage.removeItem('cyberpilot_theme');
+    setResetStatus('success');
+    setTimeout(() => setResetStatus(null), 2000);
   };
 
   const loadApiKeys = async () => {
@@ -426,6 +429,31 @@ export default function SettingsPanel() {
           </div>
         )}
 
+        {!keysLoading && apiKeys.length === 0 && !localStorage.getItem('cyberpilot_api_key') && (
+          <div style={{ marginBottom: '1rem', padding: '1rem', background: 'rgba(251,191,36,0.1)', border: '1px solid rgba(251,191,36,0.3)', borderRadius: '8px', color: 'var(--warning)', fontSize: '0.85rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
+              <AlertTriangle size={16} />
+              <strong>No API keys configured yet</strong>
+            </div>
+            <p style={{ marginBottom: '0.75rem' }}>You need an API key to use CyberPilot. Create one below.</p>
+            <form onSubmit={handleCreateKey} style={{ display: 'flex', gap: '0.5rem' }}>
+              <input
+                type="text"
+                value={newKeyName}
+                onChange={(e) => setNewKeyName(e.target.value)}
+                placeholder="Key name (e.g., my-computer)"
+                style={{ flex: 1, padding: '0.5rem 1rem', background: 'rgba(255,255,255,0.04)', border: '1px solid var(--glass-border)', borderRadius: '6px', color: 'var(--text-primary)', fontFamily: 'var(--font-main)', fontSize: '0.9rem', outline: 'none' }}
+              />
+              <button type="submit" disabled={creatingKey || !newKeyName.trim()} className="btn btn-primary" style={{ padding: '0.5rem 1rem', fontSize: '0.85rem' }}>
+                {creatingKey ? <><Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} /> Creating…</> : <><Plus size={14} /> Create Key</>}
+              </button>
+            </form>
+            <p className="text-muted" style={{ marginTop: '0.5rem', fontSize: '0.75rem' }}>
+              This creates your first API key using bootstrap mode (no prior keys needed).
+            </p>
+          </div>
+        )}
+
         {keysLoading ? (
           <div className="glass-panel" style={{ padding: '2rem', textAlign: 'center' }}>
             <Loader2 size={32} color="var(--accent-primary)" style={{ animation: 'spin 1s linear infinite', margin: '0 auto 1rem' }} />
@@ -509,6 +537,16 @@ export default function SettingsPanel() {
             Reset to Defaults
           </button>
 
+          {resetStatus === 'success' && (
+            <span style={{
+              display: 'flex', alignItems: 'center', gap: '0.35rem',
+              color: 'var(--warning)', fontSize: '0.85rem',
+              animation: 'slideIn 0.3s ease-out',
+            }}>
+              <AlertTriangle size={14} style={{ animation: 'bounce 0.5s ease' }} />
+              Reset to defaults!
+            </span>
+          )}
           {saveStatus === 'success' && (
             <span style={{ color: 'var(--success)', fontSize: '0.85rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
               <Check size={14} /> Settings saved to localStorage

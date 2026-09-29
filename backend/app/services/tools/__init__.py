@@ -41,7 +41,7 @@ DEFAULT_TOOL_CONFIGS = {
     "nmap": {
         "enabled": True,
         "timeout": 300,
-        "scan_type": "syn",
+        "scan_type": "connect",
         "ports": "top100",
     },
     "semgrep": {

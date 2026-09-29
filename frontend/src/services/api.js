@@ -106,12 +106,61 @@ export async function listApiKeys() {
  * @returns {Promise<{id: number, name: string, key: string, key_prefix: string, created_at: string}>}
  */
 export async function createApiKey(name = 'default') {
-  const res = await fetch(`${getBaseUrl()}/auth/keys`, {
-    method: 'POST',
-    headers: getHeaders(),
-    body: JSON.stringify({ name }),
-  });
-  return handleResponse(res);
+  const apiKey = getApiKey();
+  // If no key is stored, use /setup bootstrap
+  if (!apiKey) {
+    const res = await fetch(`${getBaseUrl().replace('/api/v1', '')}/setup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ name }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      localStorage.setItem('cyberpilot_api_key', data.key);
+      return { id: 0, name: data.name, key: data.key, key_prefix: data.key.slice(0, 8), created_at: new Date().toISOString() };
+    }
+    throw new Error('Please create an API key first via the setup page.');
+  }
+  // Key is stored — try via auth endpoint, fall back to /setup on auth failure
+  try {
+    const res = await fetch(`${getBaseUrl()}/auth/keys`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ name }),
+    });
+    if (res.ok) {
+      const data = await handleResponse(res);
+      return data;
+    }
+    // 401 = stored key is stale/invalid (DB was reset). Fall back to /setup.
+    if (res.status === 401) {
+      const setupRes = await fetch(`${getBaseUrl().replace('/api/v1', '')}/setup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ name }),
+      });
+      if (setupRes.ok) {
+        const data = await setupRes.json();
+        localStorage.setItem('cyberpilot_api_key', data.key);
+        return { id: 0, name: data.name, key: data.key, key_prefix: data.key.slice(0, 8), created_at: new Date().toISOString() };
+      }
+    }
+    throw new Error((await res.json().catch(() => ({ detail: 'Request failed' }))).detail || 'Failed to create key');
+  } catch (err) {
+    if (err.message.includes('create an API key first')) throw err;
+    // Last resort: try /setup
+    const setupRes = await fetch(`${getBaseUrl().replace('/api/v1', '')}/setup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ name }),
+    });
+    if (setupRes.ok) {
+      const data = await setupRes.json();
+      localStorage.setItem('cyberpilot_api_key', data.key);
+      return { id: 0, name: data.name, key: data.key, key_prefix: data.key.slice(0, 8), created_at: new Date().toISOString() };
+    }
+    throw new Error('Could not create API key. Is the backend running?');
+  }
 }
 
 /**

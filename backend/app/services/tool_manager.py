@@ -176,7 +176,18 @@ class ToolManager:
     
     def _standardize_finding(self, raw_finding: Dict[str, Any], agent_name: str, tool_name: str) -> Dict[str, Any]:
         """Convert tool-specific finding to standard format."""
-        # Map tool severity to standard severity
+        # Copy over any extra fields that don't have a dedicated slot,
+        # so downstream consumers (e.g. recon_node) can still see them.
+        raw_type = raw_finding.get("type", "")
+        metadata_extra = {}
+        # nmap findings carry a nested service dict under "service"
+        if raw_type == "open_port" and raw_finding.get("service"):
+            metadata_extra["service"] = raw_finding["service"]
+        # code scanners carry file/line — already handled below, but preserve any extra
+        for k in ("file", "line", "rule_id", "cwe", "owasp", "references", "protocol"):
+            if k in raw_finding and k not in ("file", "line", "rule_id", "cwe", "owasp", "references"):
+                metadata_extra[k] = raw_finding[k]
+
         severity_map = {
             "CRITICAL": "HIGH",
             "HIGH": "HIGH",
@@ -185,32 +196,38 @@ class ToolManager:
             "INFO": "LOW",
             "UNKNOWN": "LOW"
         }
-        
+
         raw_severity = raw_finding.get("severity", "INFO").upper()
         standard_severity = severity_map.get(raw_severity, "LOW")
-        
+
         # Get remediation
         remediation = raw_finding.get("remediation", "")
         if not remediation:
             remediation = self._get_default_remediation(raw_finding, tool_name)
-        
+
+        # Build base metadata
+        metadata = {
+            "tool": tool_name,
+            "raw_type": raw_type,
+            "raw_severity": raw_finding.get("severity", ""),
+            "rule_id": raw_finding.get("rule_id", ""),
+            "file": raw_finding.get("file", ""),
+            "line": raw_finding.get("line", 0),
+            "port": raw_finding.get("port", 0),
+            "cwe": raw_finding.get("cwe", []),
+            "owasp": raw_finding.get("owasp", []),
+            "references": raw_finding.get("references", []),
+        }
+        # Merge in any extra fields captured above
+        metadata.update(metadata_extra)
+
         return {
             "agent_name": agent_name,
             "tool": tool_name,
             "severity": standard_severity,
             "description": raw_finding.get("description", ""),
             "remediation": remediation,
-            "metadata": {
-                "tool": tool_name,
-                "raw_type": raw_finding.get("type", ""),
-                "raw_severity": raw_finding.get("severity", ""),
-                "rule_id": raw_finding.get("rule_id", ""),
-                "file": raw_finding.get("file", ""),
-                "line": raw_finding.get("line", 0),
-                "cwe": raw_finding.get("cwe", []),
-                "owasp": raw_finding.get("owasp", []),
-                "references": raw_finding.get("references", []),
-            }
+            "metadata": metadata
         }
     
     def _get_default_remediation(self, finding: Dict[str, Any], tool_name: str) -> str:

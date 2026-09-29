@@ -1,16 +1,34 @@
 """
-CyberPilot Report Generator — WeasyPrint + Jinja2 pipeline.
+CyberPilot Report Generator — WeasyPrint + Jinja2 pipeline (with ReportLab fallback).
 
-Renders the existing HTML templates to PDF via WeasyPrint. This replaces
-the previous 565-line ReportLab generator with a clean HTML/CSS-driven
-pipeline that uses the hand-designed templates in templates/reports/.
+Renders the existing HTML templates to PDF via WeasyPrint when GTK3 is available.
+Falls back to ReportLab for PDF generation when WeasyPrint is unavailable (e.g. no GTK3 on Windows).
 """
 import os
 import json
+import re
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+
 from jinja2 import Environment, FileSystemLoader, select_autoescape
-from weasyprint import HTML
+
+# --- WeasyPrint (requires GTK3 on Windows) ---
+try:
+    from weasyprint import HTML
+    HAS_WEASYPRINT = True
+except (ImportError, OSError):
+    HAS_WEASYPRINT = False
+
+# --- ReportLab fallback ---
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    HAS_REPORTLAB = True
+except ImportError:
+    HAS_REPORTLAB = False
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(HERE, "templates", "reports")
@@ -23,15 +41,16 @@ jinja_env = Environment(
     autoescape=select_autoescape(["html", "xml"]),
 )
 
+# ---------------------------------------------------------------------------
+# Context builders (used by both WeasyPrint and ReportLab paths)
+# ---------------------------------------------------------------------------
 
 def _build_executive_context(scan_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Build Jinja context for the executive summary template."""
     findings = scan_data.get("findings", [])
     compliance = scan_data.get("compliance", [])
     overall_score = scan_data.get("overall_score", 0)
     scan_id = scan_data.get("scan_id", "unknown")
     target_url = str(scan_data.get("target_url", ""))
-
     high_count = sum(1 for f in findings if f.get("severity") == "HIGH")
     medium_count = sum(1 for f in findings if f.get("severity") == "MEDIUM")
     low_count = sum(1 for f in findings if f.get("severity") == "LOW")
@@ -47,7 +66,6 @@ def _build_executive_context(scan_data: Dict[str, Any]) -> Dict[str, Any]:
         risk_level = "HIGH"
 
     scan_date = scan_data.get("scan_date", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-
     top_risks = []
     for f in findings[:3]:
         top_risks.append({
@@ -76,7 +94,6 @@ def _build_executive_context(scan_data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_technical_context(scan_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Build Jinja context for the technical report template."""
     findings = scan_data.get("findings", [])
     compliance = scan_data.get("compliance", [])
     overall_score = scan_data.get("overall_score", 0)
@@ -98,29 +115,22 @@ def _build_technical_context(scan_data: Dict[str, Any]) -> Dict[str, Any]:
     findings_by_agent: Dict[str, List[Dict]] = {}
     for f in findings:
         agent = f.get("agent_name", "Unknown")
-        if agent not in findings_by_agent:
-            findings_by_agent[agent] = []
-        findings_by_agent[agent].append(f)
+        findings_by_agent.setdefault(agent, []).append(f)
 
     compliance_by_agent: Dict[str, List[Dict]] = {}
     for c in compliance:
         agent = c.get("agent_name", "Unknown")
-        if agent not in compliance_by_agent:
-            compliance_by_agent[agent] = []
-        compliance_by_agent[agent].append(c)
+        compliance_by_agent.setdefault(agent, []).append(c)
 
     for agent, items in compliance_by_agent.items():
         for item in items:
-            if isinstance(item.get("owasp_llm"), str):
-                try:
-                    item["owasp_llm"] = json.loads(item["owasp_llm"])
-                except (json.JSONDecodeError, TypeError):
-                    item["owasp_llm"] = []
-            if isinstance(item.get("nist_csf"), str):
-                try:
-                    item["nist_csf"] = json.loads(item["nist_csf"])
-                except (json.JSONDecodeError, TypeError):
-                    item["nist_csf"] = []
+            for key in ("owasp_llm", "nist_csf"):
+                val = item.get(key)
+                if isinstance(val, str):
+                    try:
+                        item[key] = json.loads(val)
+                    except (json.JSONDecodeError, TypeError):
+                        item[key] = []
 
     return {
         "scan_id": scan_id,
@@ -135,30 +145,84 @@ def _build_technical_context(scan_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _render_pdf(html_content: str, output_path: str) -> str:
-    """Render HTML to PDF via WeasyPrint."""
+# ---------------------------------------------------------------------------
+# WeasyPrint PDF path
+# ---------------------------------------------------------------------------
+
+def _render_pdf_weasyprint(html_content: str, output_path: str) -> str:
     HTML(string=html_content, base_url=HERE).write_pdf(output_path)
     return output_path
 
 
 def generate_executive_summary_pdf(scan_data: Dict[str, Any], output_path: str) -> str:
-    """Generate executive summary PDF from Jinja2 template."""
     template = jinja_env.get_template("executive_summary.html")
     context = _build_executive_context(scan_data)
     html = template.render(**context)
-    return _render_pdf(html, output_path)
+    return _render_pdf_weasyprint(html, output_path)
 
 
 def generate_technical_report_pdf(scan_data: Dict[str, Any], output_path: str) -> str:
-    """Generate technical report PDF from Jinja2 template."""
     template = jinja_env.get_template("technical_report.html")
     context = _build_technical_context(scan_data)
     html = template.render(**context)
-    return _render_pdf(html, output_path)
+    return _render_pdf_weasyprint(html, output_path)
 
+
+# ---------------------------------------------------------------------------
+# ReportLab PDF path (fallback when WeasyPrint is unavailable)
+# ---------------------------------------------------------------------------
+
+def _render_pdf_reportlab(html_content: str, output_path: str) -> str:
+    """Render a simplified PDF using ReportLab from HTML content."""
+    if not HAS_REPORTLAB:
+        return output_path
+    doc = SimpleDocTemplate(output_path, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
+    title_style = ParagraphStyle("ReportTitle", parent=styles["Heading1"],
+                                  fontSize=18, spaceAfter=12, textColor=colors.HexColor("#1e293b"))
+    story.append(Paragraph("CyberPilot Security Assessment Report", title_style))
+    story.append(Spacer(1, 0.15 * inch))
+    text_content = re.sub(r"<[^>]+>", "\n", html_content)
+    text_content = re.sub(r"\n\s*\n", "\n", text_content)
+    text_content = text_content.strip()
+    body_style = ParagraphStyle("ReportBody", parent=styles["Normal"],
+                                fontSize=10, leading=14, spaceAfter=6)
+    for line in text_content.split("\n"):
+        line = line.strip()
+        if line:
+            story.append(Paragraph(line, body_style))
+            story.append(Spacer(1, 0.05 * inch))
+    doc.build(story)
+    return output_path
+
+
+def generate_executive_summary_pdf_fallback(scan_data: Dict[str, Any], output_path: str) -> str:
+    """Generate executive summary using ReportLab fallback."""
+    context = _build_executive_context(scan_data)
+    # Render to HTML first using Jinja, then convert to simple PDF
+    template = jinja_env.get_template("executive_summary.html")
+    html = template.render(**context)
+    return _render_pdf_reportlab(html, output_path)
+
+
+def generate_technical_report_pdf_fallback(scan_data: Dict[str, Any], output_path: str) -> str:
+    """Generate technical report using ReportLab fallback."""
+    context = _build_technical_context(scan_data)
+    template = jinja_env.get_template("technical_report.html")
+    html = template.render(**context)
+    return _render_pdf_reportlab(html, output_path)
+
+
+# ---------------------------------------------------------------------------
+# Public API — dispatches to WeasyPrint or ReportLab
+# ---------------------------------------------------------------------------
 
 def generate_both_reports(scan_data: Dict[str, Any], output_dir: str = None) -> Dict[str, str]:
-    """Generate both executive summary and technical report PDFs."""
+    """Generate both executive summary and technical report PDFs.
+
+    Uses WeasyPrint when available (GTK3 installed), falls back to ReportLab.
+    """
     if output_dir is None:
         output_dir = OUTPUT_DIR
     os.makedirs(output_dir, exist_ok=True)
@@ -167,8 +231,16 @@ def generate_both_reports(scan_data: Dict[str, Any], output_dir: str = None) -> 
     exec_path = os.path.join(output_dir, f"{scan_id}_executive_summary.pdf")
     tech_path = os.path.join(output_dir, f"{scan_id}_technical_report.pdf")
 
-    generate_executive_summary_pdf(scan_data, exec_path)
-    generate_technical_report_pdf(scan_data, tech_path)
+    if HAS_WEASYPRINT:
+        generate_executive_summary_pdf(scan_data, exec_path)
+        generate_technical_report_pdf(scan_data, tech_path)
+    elif HAS_REPORTLAB:
+        generate_executive_summary_pdf_fallback(scan_data, exec_path)
+        generate_technical_report_pdf_fallback(scan_data, tech_path)
+    else:
+        raise RuntimeError(
+            "Both WeasyPrint and ReportLab are unavailable. Cannot generate PDF reports."
+        )
 
     return {
         "executive_summary": os.path.abspath(exec_path),
