@@ -4,6 +4,8 @@ Used by the Code Review Agent to find insecure code patterns.
 """
 import asyncio
 import json
+import sys
+import os
 from typing import Dict, Any, List, Optional
 from app.services.tools.base import BaseScanner, ScanResult, ScanStatus
 
@@ -18,6 +20,28 @@ class SemgrepScanner(BaseScanner):
     @property
     def command_name(self) -> str:
         return "semgrep"
+
+    @property
+    def _cmd_args(self) -> List[str]:
+        """Return the full command args for checking installation.
+        Uses 'python -m semgrep' since semgrep is installed as a venv module."""
+        return [sys.executable, "-m", "semgrep", "--version"]
+
+    async def check_installed(self) -> bool:
+        """Check if semgrep is available.
+        Semgrep CLI exits with code 2 for --version (deprecation warning)
+        but is still functional. Accept exit codes 0, 1, 2."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "semgrep", "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate()
+            # semgrep returns 2 for --version (deprecation), still functional
+            return proc.returncode in (0, 1, 2)
+        except Exception:
+            return False
     
     async def scan(self, target: str, **kwargs) -> ScanResult:
         """
@@ -39,8 +63,9 @@ class SemgrepScanner(BaseScanner):
         if not await self.check_installed():
             return self.create_not_installed_result()
         
-        # Build semgrep command
-        args = [self.command_name, "scan"]
+        # Build semgrep command — use venv bin script, NOT python -m
+        # (python -m semgrep exits 2 in 1.178.0 due to deprecated __main__.py)
+        args = [os.path.join(os.path.dirname(sys.executable), "semgrep"), "scan"]
         
         # Config
         config = kwargs.get("config", "auto")

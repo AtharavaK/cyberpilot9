@@ -17,7 +17,29 @@ class TrivyScanner(BaseScanner):
     
     @property
     def command_name(self) -> str:
+        import os
+        binary_path = "/tmp/bin/trivy"
+        if os.path.isfile(binary_path) and os.access(binary_path, os.X_OK):
+            return binary_path
         return "trivy"
+
+    async def check_installed(self) -> bool:
+        """Check if trivy is installed. Looks in /tmp/bin first."""
+        import os
+        binary_path = "/tmp/bin/trivy"
+        if os.path.isfile(binary_path) and os.access(binary_path, os.X_OK):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    binary_path, "--version",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await proc.communicate()
+                return proc.returncode == 0
+            except Exception:
+                pass
+        # Fallback to PATH lookup
+        return await super().check_installed()
     
     async def scan(self, target: str, **kwargs) -> ScanResult:
         """

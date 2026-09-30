@@ -4,20 +4,34 @@ Used by the Code Review Agent for Python-specific SAST.
 """
 import asyncio
 import json
+import sys
 from typing import Dict, Any, List
 from app.services.tools.base import BaseScanner, ScanResult, ScanStatus
 
 
 class BanditScanner(BaseScanner):
     """Bandit Python security scanner wrapper."""
-    
+
     @property
     def tool_name(self) -> str:
         return "Bandit"
-    
+
     @property
     def command_name(self) -> str:
         return "bandit"
+
+    async def check_installed(self) -> bool:
+        """Check if bandit is available (via python -m bandit)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "bandit", "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate()
+            return proc.returncode == 0
+        except Exception:
+            return False
     
     async def scan(self, target: str, **kwargs) -> ScanResult:
         """
@@ -40,7 +54,7 @@ class BanditScanner(BaseScanner):
             return self.create_not_installed_result()
         
         # Build bandit command
-        args = [self.command_name, "-r", "-f", "json"]
+        args = [sys.executable, "-m", "bandit", "-r", "-f", "json"]
         
         # Severity filter
         severity = kwargs.get("severity", "low")
@@ -50,13 +64,7 @@ class BanditScanner(BaseScanner):
         confidence = kwargs.get("confidence", "low")
         args.extend(["-ii", confidence])
         
-        # Skip tests
-        if kwargs.get("skip_tests", True):
-            args.append("--skip")
-            args.append("B101,B102,B103")  # Skip assert tests, etc.
-        
-        # Extra arguments
-        extra_args = kwargs.get("extra_args", [])
+        extra_args = kwargs.get("extra_args", ["--disable-optional"])
         args.extend(extra_args)
         
         # Target path
