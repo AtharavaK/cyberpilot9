@@ -56,15 +56,15 @@ class BanditScanner(BaseScanner):
         # Build bandit command
         args = [sys.executable, "-m", "bandit", "-r", "-f", "json"]
         
-        # Severity filter
+        # Severity filter — use long-form flags (bandit -l/-i don't take inline values)
         severity = kwargs.get("severity", "low")
-        args.extend(["-ll", severity])  # Only show issues at or above this severity
-        
+        args.extend(["--severity-level", severity])
+
         # Confidence filter
         confidence = kwargs.get("confidence", "low")
-        args.extend(["-ii", confidence])
-        
-        extra_args = kwargs.get("extra_args", ["--disable-optional"])
+        args.extend(["--confidence-level", confidence])
+
+        extra_args = kwargs.get("extra_args", [])
         args.extend(extra_args)
         
         # Target path
