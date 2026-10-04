@@ -2,6 +2,8 @@ import uuid
 import asyncio
 import json
 import os
+import logging
+import shutil
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from langgraph.graph import StateGraph, END
@@ -9,8 +11,11 @@ from app.services.graph_state import CyberPilotState, ComplianceFinding
 from app.db import crud
 from app.services import report_generator
 from app.services.tool_manager import ToolManager
+from app.services.target_normalizer import TargetNormalizer
 from urllib.parse import urlparse
 import aiohttp
+
+logger = logging.getLogger(__name__)
 
 
 def calculate_risk_score(findings: List[Dict[str, Any]]) -> int:
@@ -129,9 +134,29 @@ async def recon_node(state: CyberPilotState) -> CyberPilotState:
     parsed = urlparse(state["target_url"])
     is_ip_target = not parsed.scheme or not parsed.netloc
 
-    # 1. HTTP probing
+    # ── Check normalized target ──
+    nt = state.get("target_normalized") or {}
+    target_kind = nt.get("kind", "invalid")
+    is_web_target = target_kind == "url"
+    # For IP targets, ensure it's actually a network address, not a local path
+    if is_ip_target and not is_web_target:
+        # urlparse treats bare paths (no scheme) as "no scheme, no netloc" → is_ip_target=True
+        # But a local filesystem path should NOT be treated as an IP/hostname target.
+        is_ip_target = target_kind != "local_path"
+
+    # 1. HTTP probing — only for web targets
     http_result = {}
-    if not is_ip_target:
+    if is_web_target:
+        try:
+            http_result = await _http_recon(nt.get("web_target") or state["target_url"])
+        except Exception as e:
+            http_result = {"errors": [str(e)]}
+            print(f"[{state['scan_id']}] HTTP recon failed: {e}")
+    elif not is_ip_target and target_kind not in ("url",):
+        # Local path or git repo — no HTTP probing
+        pass
+    else:
+        # IP target
         try:
             http_result = await _http_recon(state["target_url"])
         except Exception as e:
@@ -139,39 +164,50 @@ async def recon_node(state: CyberPilotState) -> CyberPilotState:
             print(f"[{state['scan_id']}] HTTP recon failed: {e}")
 
     await _emit(state["scan_id"], "progress", {
-        "message": f"Probed {len(http_result.get('endpoints', []))} HTTP endpoints",
-        "endpoints_found": len(http_result.get("endpoints", [])),
+        "message": (
+            f"Probed {len(http_result.get('endpoints', []))} HTTP endpoints"
+            if http_result
+            else f"HTTP recon skipped (target kind: {target_kind})"
+        ),
+        "endpoints_found": len(http_result.get("endpoints", [])) if http_result else 0,
+        "target_kind": target_kind,
     })
 
-    # 2. Nmap port scan
+    # 2. Nmap port scan — only for web/IP targets, not local paths
     nmap_endpoints = []
     nmap_errors = []
-    try:
-        tool_manager = ToolManager()
-        nmap_config = state.get("nmap_config", {})
-        nmap_result = await tool_manager.run_agent_tools(
-            "Recon Agent", state["target_url"],
-            allow_internal=state.get("authorize", False),
-            **nmap_config,
+    if is_web_target or is_ip_target:
+        try:
+            tool_manager = ToolManager()
+            nmap_config = state.get("nmap_config", {})
+            nmap_result = await tool_manager.run_agent_tools(
+                "Recon Agent", nt.get("web_target") or state["target_url"],
+                allow_internal=state.get("authorize", False),
+                **nmap_config,
+            )
+            nmap_findings = [f for f in nmap_result.get("findings", []) if f.get("metadata", {}).get("tool") == "nmap"]
+            for f in nmap_findings:
+                meta = f.get("metadata", {})
+                if meta.get("raw_type") == "open_port":
+                    nmap_endpoints.append({
+                        "type": "network_port",
+                        "port": meta.get("port", meta.get("line", 0)),
+                        "protocol": meta.get("raw_type", "").replace("open_", ""),
+                        "service": meta.get("service", {}),
+                    })
+            nmap_errors = nmap_result.get("errors", [])
+        except Exception as e:
+            nmap_errors.append(str(e))
+    else:
+        # Local path or git repo — Nmap is not applicable
+        logger.info(
+            "Nmap skipped: target is a local path/repository (kind=%s), "
+            "not a network target.", target_kind,
         )
-        nmap_findings = [f for f in nmap_result.get("findings", []) if f.get("metadata", {}).get("tool") == "nmap"]
-        for f in nmap_findings:
-            meta = f.get("metadata", {})
-            if meta.get("raw_type") == "open_port":
-                nmap_endpoints.append({
-                    "type": "network_port",
-                    "port": meta.get("port", meta.get("line", 0)),
-                    "protocol": meta.get("raw_type", "").replace("open_", ""),
-                    "service": meta.get("service", {}),
-                })
-        nmap_errors = nmap_result.get("errors", [])
-    except Exception as e:
-        nmap_errors.append(str(e))
-
-    await _emit(state["scan_id"], "progress", {
-        "message": f"Nmap found {len(nmap_endpoints)} open ports",
-        "ports_found": len(nmap_endpoints),
-    })
+        await _emit(state["scan_id"], "progress", {
+            "message": f"Nmap skipped (target kind: {target_kind} — not a network target)",
+            "target_kind": target_kind,
+        })
 
     # Build recon data
     endpoints = http_result.get("endpoints", [])
@@ -245,15 +281,35 @@ async def security_analysis_node(state: CyberPilotState) -> CyberPilotState:
     await _emit(state["scan_id"], "phase", {"phase": "SECURITY_ANALYSIS", "message": "Running security analysis agents..."})
 
     tool_manager = ToolManager()
-    target = state["target_url"]
+
+    # ── Resolve normalized target (populated in start_scan_workflow) ──
+    nt = state.get("target_normalized") or {}
+    web_target = nt.get("web_target")  # None for local_path targets
+    local_path = nt.get("local_path")
+    target_kind = nt.get("kind", "invalid")
+
+    # Code-review scanners require a local filesystem path.
+    has_local_target = bool(local_path) and os.path.exists(local_path)
+    # Web-only agents (AI, API) require a web target URL.
+    has_web_target = bool(web_target)
+
+    authorize = state.get("authorize", False)
 
     try:
-        # AI Security Agent
-        await _emit(state["scan_id"], "progress", {"message": "Running AI Security Agent..."})
-        ai_result = await tool_manager.run_agent_tools(
-            "AI Security Agent", target,
-            allow_internal=state.get("authorize", False),
-        )
+        # AI Security Agent — uses web target only
+        if has_web_target:
+            await _emit(state["scan_id"], "progress", {"message": "Running AI Security Agent..."})
+            ai_result = await tool_manager.run_agent_tools(
+                "AI Security Agent", web_target,
+                allow_internal=authorize,
+            )
+        else:
+            logger.info("AI Security Agent skipped: no web target (kind=%s).", target_kind)
+            await _emit(state["scan_id"], "progress", {
+                "message": "AI Security Agent skipped (no web target).",
+                "target_kind": target_kind,
+            })
+            ai_result = {"tools_run": [], "findings": [], "errors": []}
         state["ai_vulnerabilities"] = ai_result.get("findings", [])
         for f in state["ai_vulnerabilities"]:
             f["agent_name"] = "AI Security Agent"
@@ -262,12 +318,20 @@ async def security_analysis_node(state: CyberPilotState) -> CyberPilotState:
             "count": len(state["ai_vulnerabilities"]),
         })
 
-        # API Security Agent
-        await _emit(state["scan_id"], "progress", {"message": "Running API Security Agent..."})
-        api_result = await tool_manager.run_agent_tools(
-            "API Security Agent", target,
-            allow_internal=state.get("authorize", False),
-        )
+        # API Security Agent — uses web target only
+        if has_web_target:
+            await _emit(state["scan_id"], "progress", {"message": "Running API Security Agent..."})
+            api_result = await tool_manager.run_agent_tools(
+                "API Security Agent", web_target,
+                allow_internal=authorize,
+            )
+        else:
+            logger.info("API Security Agent skipped: no web target (kind=%s).", target_kind)
+            await _emit(state["scan_id"], "progress", {
+                "message": "API Security Agent skipped (no web target).",
+                "target_kind": target_kind,
+            })
+            api_result = {"tools_run": [], "findings": [], "errors": []}
         state["api_vulnerabilities"] = api_result.get("findings", [])
         for f in state["api_vulnerabilities"]:
             f["agent_name"] = "API Security Agent"
@@ -276,12 +340,28 @@ async def security_analysis_node(state: CyberPilotState) -> CyberPilotState:
             "count": len(state["api_vulnerabilities"]),
         })
 
-        # Code Review Agent
+        # Code Review Agent — uses local_path when available
         await _emit(state["scan_id"], "progress", {"message": "Running Code Review Agent..."})
-        code_result = await tool_manager.run_agent_tools(
-            "Code Review Agent", target,
-            allow_internal=state.get("authorize", False),
-        )
+        if has_local_target:
+            code_result = await tool_manager.run_agent_tools(
+                "Code Review Agent", local_path,
+                allow_internal=authorize,
+            )
+        else:
+            logger.info(
+                "Code review scanners skipped: target is not a local source/repository "
+                "(kind=%s).", target_kind,
+            )
+            await _emit(state["scan_id"], "progress", {
+                "message": "Code review scanners skipped: target is not a local source/repository.",
+                "target_kind": target_kind,
+            })
+            code_result = {
+                "tools_run": [],
+                "findings": [],
+                "errors": ["Code review scanners skipped: no local source path.",
+                           f"Target kind is '{target_kind}' — provide a local path or git repo URL."],
+            }
         state["code_vulnerabilities"] = code_result.get("findings", [])
         for f in state["code_vulnerabilities"]:
             f["agent_name"] = "Code Review Agent"
@@ -290,11 +370,14 @@ async def security_analysis_node(state: CyberPilotState) -> CyberPilotState:
             "count": len(state["code_vulnerabilities"]),
         })
 
-        # Infrastructure Agent
+        # Infrastructure Agent (Trivy) — uses local_path when available,
+        # otherwise falls back to web_target (trivy has its own repo detection)
         await _emit(state["scan_id"], "progress", {"message": "Running Infrastructure Agent..."})
+        infra_target = local_path if has_local_target else web_target
+        assert infra_target is not None, "infra_target should not be None"
         infra_result = await tool_manager.run_agent_tools(
-            "Infrastructure Agent", target,
-            allow_internal=state.get("authorize", False),
+            "Infrastructure Agent", infra_target,
+            allow_internal=authorize,
         )
         state["infra_vulnerabilities"] = infra_result.get("findings", [])
         for f in state["infra_vulnerabilities"]:
@@ -606,6 +689,18 @@ async def report_node(state: CyberPilotState) -> CyberPilotState:
         "data_source": state.get("data_source", "real_tools"),
     })
 
+    # ── Clean up temporary clone directories ──
+    nt = state.get("target_normalized")
+    if nt and nt.get("clone_dir"):
+        clone_dir = nt["clone_dir"]
+        if clone_dir and os.path.isdir(clone_dir):
+            # Only remove directories we created (under /tmp)
+            real_clone = os.path.realpath(clone_dir)
+            tmp_base = os.path.realpath("/tmp")
+            if real_clone.startswith(tmp_base):
+                shutil.rmtree(real_clone, ignore_errors=True)
+                logger.info("Cleaned up temporary clone: %s", real_clone)
+
     return state
 
 
@@ -802,7 +897,47 @@ async def start_scan_workflow(
         "nmap_config": nmap_config or {},
         "_scan_started_at": datetime.utcnow().timestamp(),
         "_scan_timeout_seconds": scan_timeout_seconds,
+        "target_normalized": None,
     }
+
+    # Normalize the target once — clone repos if needed.
+    # This happens before the workflow starts so all nodes share the same
+    # normalized target info.
+    if data_source == "real_tools":
+        normalizer = TargetNormalizer()
+        try:
+            normalized = await normalizer.normalize(target_url_str, clone=True)
+            if normalized.error:
+                await crud.update_scan_error(scan_id, normalized.error)
+                # Still proceed — the workflow nodes will handle missing local_path
+            initial_state["target_normalized"] = {
+                "original": normalized.original,
+                "kind": normalized.kind,
+                "web_target": normalized.web_target,
+                "local_path": normalized.local_path,
+                "is_local": normalized.is_local,
+                "clone_dir": normalized.clone_dir,
+                "scanners": normalized.scanners,
+            }
+            if not normalized.error:
+                logger.info(
+                    "Target type: %s. Web scanners: %s. Code scanners: %s.",
+                    normalized.kind,
+                    normalized.scanners.get("web", []),
+                    normalized.scanners.get("code_review", []) or "skipped",
+                )
+        except Exception as e:
+            logger.warning("Target normalization failed for %s: %s", target_url_str, e)
+            initial_state["target_normalized"] = {
+                "original": target_url_str,
+                "kind": "invalid",
+                "web_target": target_url_str,
+                "local_path": None,
+                "is_local": False,
+                "clone_dir": None,
+                "error": str(e),
+                "scanners": {"code_review": [], "web": [], "infra": []},
+            }
 
     async def _watchdog():
         await asyncio.sleep(scan_timeout_seconds)

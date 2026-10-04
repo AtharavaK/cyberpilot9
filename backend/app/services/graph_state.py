@@ -50,3 +50,6 @@ class CyberPilotState(TypedDict):
     nmap_config: Dict[str, Any]
     # Interactive features
     remediation_details: Dict[int, Dict[str, Any]]  # per-finding structured fix steps
+    # Normalized target info from TargetNormalizer (see target_normalizer.py).
+    # Populated in start_scan_workflow; consumed by security_analysis_node.
+    target_normalized: Optional[Dict[str, Any]]
