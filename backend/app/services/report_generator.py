@@ -46,14 +46,18 @@ jinja_env = Environment(
 # ---------------------------------------------------------------------------
 
 def _build_executive_context(scan_data: Dict[str, Any]) -> Dict[str, Any]:
+    from app.services.finding_normalizer import redact_sensitive_text, normalize_severity
     findings = scan_data.get("findings", [])
     compliance = scan_data.get("compliance", [])
     overall_score = scan_data.get("overall_score", 0)
     scan_id = scan_data.get("scan_id", "unknown")
     target_url = str(scan_data.get("target_url", ""))
-    high_count = sum(1 for f in findings if f.get("severity") == "HIGH")
-    medium_count = sum(1 for f in findings if f.get("severity") == "MEDIUM")
-    low_count = sum(1 for f in findings if f.get("severity") == "LOW")
+    # Count all canonical severities
+    critical_count = sum(1 for f in findings if normalize_severity(f.get("severity", "")) == "CRITICAL")
+    high_count = sum(1 for f in findings if normalize_severity(f.get("severity", "")) == "HIGH")
+    medium_count = sum(1 for f in findings if normalize_severity(f.get("severity", "")) == "MEDIUM")
+    low_count = sum(1 for f in findings if normalize_severity(f.get("severity", "")) == "LOW")
+    info_count = sum(1 for f in findings if normalize_severity(f.get("severity", "")) == "INFO")
 
     if overall_score >= 80:
         risk_color = "#10b981"
@@ -69,8 +73,8 @@ def _build_executive_context(scan_data: Dict[str, Any]) -> Dict[str, Any]:
     top_risks = []
     for f in findings[:3]:
         top_risks.append({
-            "description": f.get("description", ""),
-            "severity": f.get("severity", "LOW"),
+            "description": redact_sensitive_text(f.get("description", "")),
+            "severity": normalize_severity(f.get("severity", "LOW")),
             "agent_name": f.get("agent_name", ""),
             "remediation": f.get("remediation") or "No specific remediation provided.",
         })
@@ -82,9 +86,11 @@ def _build_executive_context(scan_data: Dict[str, Any]) -> Dict[str, Any]:
         "overall_score": overall_score,
         "risk_color": risk_color,
         "risk_level": risk_level,
+        "critical_count": critical_count,
         "high_count": high_count,
         "medium_count": medium_count,
         "low_count": low_count,
+        "info_count": info_count,
         "total_findings": len(findings),
         "top_risks": top_risks,
         "compliance_count": len(compliance),
@@ -94,8 +100,20 @@ def _build_executive_context(scan_data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_technical_context(scan_data: Dict[str, Any]) -> Dict[str, Any]:
+    from app.services.finding_normalizer import normalize_severity, redact_sensitive_text
     findings = scan_data.get("findings", [])
     compliance = scan_data.get("compliance", [])
+    # Normalize finding severities and redact sensitive content for display
+    normalized_findings = []
+    for f in findings:
+        nf = dict(f)
+        nf["severity"] = normalize_severity(f.get("severity", "LOW"))
+        if nf.get("description"):
+            nf["description"] = redact_sensitive_text(nf["description"])
+        if nf.get("evidence"):
+            nf["evidence"] = redact_sensitive_text(nf["evidence"])
+        normalized_findings.append(nf)
+    findings = normalized_findings
     overall_score = scan_data.get("overall_score", 0)
     scan_id = scan_data.get("scan_id", "unknown")
     target_url = str(scan_data.get("target_url", ""))

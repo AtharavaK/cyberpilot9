@@ -17,29 +17,14 @@ class GitleaksScanner(BaseScanner):
 
     @property
     def command_name(self) -> str:
-        import os
-        binary_path = "/tmp/bin/gitleaks"
-        if os.path.isfile(binary_path) and os.access(binary_path, os.X_OK):
-            return binary_path
+        """Return the gitleaks executable name for PATH lookup."""
         return "gitleaks"
 
     async def check_installed(self) -> bool:
-        """Check if gitleaks is installed. Looks in /tmp/bin first."""
-        import os
-        binary_path = "/tmp/bin/gitleaks"
-        if os.path.isfile(binary_path) and os.access(binary_path, os.X_OK):
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    binary_path, "--version",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                await proc.communicate()
-                return proc.returncode == 0
-            except Exception:
-                pass
-        # Fallback to PATH lookup
-        return await super().check_installed()
+        """Check if gitleaks is installed and available on PATH."""
+        # Standard PATH lookup — no hardcoded paths
+        import shutil
+        return shutil.which("gitleaks") is not None
 
     async def scan(self, target: str, **kwargs) -> ScanResult:
         """
@@ -69,6 +54,8 @@ class GitleaksScanner(BaseScanner):
 
         # Suppress banner/colors in stderr for cleaner logs
         args.extend(["--no-banner", "--no-color"])
+        # Redact secrets in all output — never expose actual secret values
+        args.append("--redact")
 
         # Verbose
         if kwargs.get("verbose", False):
@@ -156,8 +143,11 @@ class GitleaksScanner(BaseScanner):
                 date = result.get("Date", "")
                 tag = result.get("Tag", "")
 
-                # Mask secret for display
+                # Mask secret for display — never store the full unmasked secret
                 masked_secret = secret[:4] + "*" * (len(secret) - 8) + secret[-4:] if len(secret) > 8 else "****"
+                # Ensure the masked secret is also redacted of any pattern matches
+                from app.services.finding_normalizer import redact_sensitive_text
+                masked_secret = redact_sensitive_text(masked_secret)
 
                 findings.append({
                     "type": "secret_finding",
@@ -167,7 +157,7 @@ class GitleaksScanner(BaseScanner):
                     "file": file,
                     "line": line_num,
                     "secret": masked_secret,
-                    "secret_full": secret,  # Full secret for remediation
+                    # secret_full intentionally omitted — never store full secrets
                     "description": f"[{rule_id}] {description} found in {file}:{line_num}",
                     "commit": commit,
                     "author": author,

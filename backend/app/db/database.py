@@ -35,6 +35,7 @@ async def init_db():
             ("paused INTEGER DEFAULT 0",                        "paused"),
             ("cancelled INTEGER DEFAULT 0",                     "cancelled"),
             ("webhook_id INTEGER",                              "webhook_id"),
+            ("clone_dir TEXT",                                 "clone_dir"),
         ]:
             try:
                 await conn.execute(f"ALTER TABLE scans ADD COLUMN {col_def}")
@@ -57,6 +58,7 @@ async def init_db():
 
         for col_def, col_name in [
             ("remediation_details TEXT",   "remediation_details"),
+            ("created_at DATETIME DEFAULT (datetime('now'))", "created_at"),
         ]:
             try:
                 await conn.execute(f"ALTER TABLE findings ADD COLUMN {col_def}")
@@ -133,6 +135,31 @@ async def init_db():
             )
         """)
 
+        # ── NEW: ai_analysis — AI engine analysis results (Phase 3) ────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS ai_analysis (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                finding_id          INTEGER,              -- nullable: AI analysis may run
+                                                              -- before finding is persisted
+                scan_id             TEXT NOT NULL,
+                model               TEXT NOT NULL,
+                analysis_json       TEXT NOT NULL,     -- full AIAnalysis as JSON
+                ai_confidence       REAL,              -- AI's confidence in its own assessment
+                status              TEXT DEFAULT 'completed',  -- completed / failed
+                prompt_version      TEXT DEFAULT 'v1.0',
+                error               TEXT,
+                created_at          DATETIME DEFAULT (datetime('now')),
+                FOREIGN KEY (finding_id) REFERENCES findings(id),
+                FOREIGN KEY (scan_id) REFERENCES scans(scan_id)
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_analysis_finding ON ai_analysis(finding_id)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_analysis_scan ON ai_analysis(scan_id)"
+        )
+
         # ── NEW: scan_sessions — pause/resume/cancel state ──────────────────────
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS scan_sessions (
@@ -150,6 +177,120 @@ async def init_db():
                 FOREIGN KEY (scan_id) REFERENCES scans(scan_id)
             )
         """)
+
+        # ── NEW: assessment_tasks — Phase 5 task persistence ─────────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS assessment_tasks (
+                task_id            TEXT PRIMARY KEY,
+                scan_id            TEXT NOT NULL,
+                agent              TEXT NOT NULL,
+                tool               TEXT NOT NULL,
+                objective          TEXT,
+                target             TEXT,
+                priority           INTEGER,
+                status             TEXT DEFAULT 'pending',
+                dependencies       TEXT DEFAULT '[]',  -- JSON
+                reason             TEXT,
+                config             TEXT DEFAULT '{}',  -- JSON
+                scan_mode          TEXT DEFAULT 'passive',
+                created_at         DATETIME DEFAULT (datetime('now')),
+                started_at         DATETIME,
+                completed_at       DATETIME,
+                agent_result_json  TEXT,  -- JSON: AgentResult serialized
+                FOREIGN KEY (scan_id) REFERENCES scans(scan_id)
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assessment_tasks_scan ON assessment_tasks(scan_id)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assessment_tasks_status ON assessment_tasks(status)"
+        )
+
+        # ── NEW: agent_decisions — Phase 5 audit trail ────────────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_decisions (
+                decision_id          TEXT PRIMARY KEY,
+                scan_id              TEXT NOT NULL,
+                decision_type        TEXT NOT NULL,
+                outcome              TEXT NOT NULL,
+                reason               TEXT,
+                task_id              TEXT,
+                agent                TEXT,
+                tool                 TEXT,
+                target               TEXT,
+                policy_validation    TEXT,  -- JSON
+                created_at           DATETIME DEFAULT (datetime('now')),
+                FOREIGN KEY (scan_id) REFERENCES scans(scan_id),
+                FOREIGN KEY (task_id) REFERENCES assessment_tasks(task_id)
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_decisions_scan ON agent_decisions(scan_id)"
+        )
+
+        # ── NEW: assessment_plans — Phase 5 plan persistence ─────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS assessment_plans (
+                plan_id            TEXT PRIMARY KEY,
+                scan_id            TEXT NOT NULL UNIQUE,
+                target             TEXT,
+                target_kind        TEXT,
+                authorized_target   TEXT,
+                authorization_mode  TEXT,
+                allow_active_scanning INTEGER DEFAULT 0,
+                allow_private_targets   INTEGER DEFAULT 0,
+                objective          TEXT,
+                plan_json          TEXT NOT NULL,  -- full AssessmentPlan as JSON
+                max_iterations      INTEGER DEFAULT 5,
+                max_tasks           INTEGER DEFAULT 30,
+                max_runtime_seconds INTEGER DEFAULT 900,
+                created_at          DATETIME DEFAULT (datetime('now')),
+                FOREIGN KEY (scan_id) REFERENCES scans(scan_id)
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assessment_plans_scan ON assessment_plans(scan_id)"
+        )
+
+        # ── Migration: allow NULL finding_id in ai_analysis ──────────────────
+        # SQLite cannot ALTER COLUMN to drop a NOT NULL constraint, so use the
+        # table-rebuild pattern.  This is idempotent: if the column is already
+        # nullable (new DB) the pragma check skips the migration.
+        col_info = await conn.execute_fetchall(
+            "PRAGMA table_info(ai_analysis)"
+        )
+        finding_col_nullable = any(
+            row[1] == "finding_id" and row[3] == 0 for row in col_info
+        )
+        if not finding_col_nullable:
+            # Rebuild ai_analysis with a nullable finding_id
+            await conn.executescript("""
+                CREATE TABLE ai_analysis_new (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    finding_id          INTEGER,
+                    scan_id             TEXT NOT NULL,
+                    model               TEXT NOT NULL,
+                    analysis_json       TEXT NOT NULL,
+                    ai_confidence       REAL,
+                    status              TEXT DEFAULT 'completed',
+                    prompt_version      TEXT DEFAULT 'v1.0',
+                    error               TEXT,
+                    created_at          DATETIME DEFAULT (datetime('now')),
+                    FOREIGN KEY (finding_id) REFERENCES findings(id),
+                    FOREIGN KEY (scan_id) REFERENCES scans(scan_id)
+                );
+                INSERT INTO ai_analysis_new (id, finding_id, scan_id, model,
+                    analysis_json, ai_confidence, status, prompt_version,
+                    error, created_at)
+                SELECT id, finding_id, scan_id, model, analysis_json,
+                    ai_confidence, status, prompt_version, error, created_at
+                FROM ai_analysis;
+                DROP TABLE ai_analysis;
+                ALTER TABLE ai_analysis_new RENAME TO ai_analysis;
+                CREATE INDEX IF NOT EXISTS idx_ai_analysis_finding ON ai_analysis(finding_id);
+                CREATE INDEX IF NOT EXISTS idx_ai_analysis_scan ON ai_analysis(scan_id);
+            """)
 
         await conn.commit()
     print(f"[DB] Initialized SQLite database at: {DB_PATH}")

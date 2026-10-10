@@ -53,3 +53,16 @@ class CyberPilotState(TypedDict):
     # Normalized target info from TargetNormalizer (see target_normalizer.py).
     # Populated in start_scan_workflow; consumed by security_analysis_node.
     target_normalized: Optional[Dict[str, Any]]
+
+    # ── Phase 5: Assessment Plan & Task State ──────────────────────────────
+    assessment_plan: Optional[Dict[str, Any]]  # serialized AssessmentPlan
+    tasks: List[Dict[str, Any]]                # all SecurityTasks
+    agent_results: List[Dict[str, Any]]        # all AgentResults
+    decisions: List[Dict[str, Any]]            # MasterDecision audit trail
+    policy_decisions: List[Dict[str, Any]]     # policy validation records
+    iteration: int                             # current iteration (0-indexed)
+    max_iterations: int                        # bound on loop
+    ai_analyses: List[Dict[str, Any]]          # AIAnalysis results for findings
+    task_results: Dict[str, Dict[str, Any]]    # task_id → AgentResult
+    completion_reason: Optional[str]           # why the assessment stopped
+    scan_budget: Dict[str, Any]                # runtime/resource budget tracking

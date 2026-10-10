@@ -45,10 +45,27 @@ class ReportSummary(BaseModel):
 # ── Findings ────────────────────────────────────────────────────────────────────
 
 class Finding(BaseModel):
+    id: Optional[int] = None
     agent_name: str
+    scanner: Optional[str] = None  # canonical alias for agent_name
+    tool: Optional[str] = None
     severity: str
+    confidence: Optional[float] = None  # 0.0 - 1.0
+    title: Optional[str] = None
+    category: Optional[str] = None
     description: str
+    evidence: Optional[str] = None
     remediation: Optional[str] = None
+    target: Optional[str] = None
+    file: Optional[str] = None
+    line: Optional[int] = None
+    location: Optional[Dict[str, Any]] = None  # canonical location object
+    cwe: Optional[List[str]] = None
+    cve: Optional[List[str]] = None
+    references: Optional[List[str]] = None
+    status: Optional[str] = None  # triage status: open/in_progress/false_positive/accepted/remediated
+    data_source: Optional[str] = None
+    created_at: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
     remediation_details: Optional[Dict[str, Any]] = None  # structured fix steps
 
@@ -111,7 +128,7 @@ class FindingsExplorerResponse(BaseModel):
 # ── Triage ─────────────────────────────────────────────────────────────────────
 
 class TriageRequest(BaseModel):
-    status: str = Field(..., pattern=r"^(open|false_positive|accepted|remediated)$")
+    status: str = Field(..., pattern=r"^(open|in_progress|false_positive|accepted|remediated)$")
     note: Optional[str] = None
 
 
@@ -184,3 +201,83 @@ class RemediationDetailsResponse(BaseModel):
     remediation: Optional[str]
     steps: List[RemediationStep]
     references: List[str]
+
+
+# ── AI Analysis (Phase 3) ──────────────────────────────────────────────────────
+
+class AIAnalysisBase(BaseModel):
+    """Base fields for AI analysis output.
+
+    This is a SEPARATE object from Finding — the AI does NOT modify the
+    original security finding.  It only produces analysis of the finding.
+    """
+    summary: str
+    risk_explanation: str
+    exploitability: str  # "low" | "medium" | "high"
+    impact: str
+    false_positive_assessment: str  # "likely_true" | "likely_false_positive" | "uncertain"
+    confidence: float  # 0.0–1.0 — AI's confidence in its own assessment
+    root_cause: Optional[str] = None
+    remediation: str
+    references: List[str] = Field(default_factory=list)
+    priority: Optional[int] = None  # 1–10
+
+    model_config = {"validate_assignment": True}
+
+
+class AIAnalysisCreate(AIAnalysisBase):
+    finding_id: Optional[int] = None
+    scan_id: Optional[str] = None
+    model: str = "unknown"
+
+
+class AIAnalysisSchema(AIAnalysisBase):
+    """Full AI analysis record as stored in / returned from the database."""
+    finding_id: Optional[int] = None
+    scan_id: Optional[str] = None
+    model: str
+    prompt_version: str = "v1.0"
+    created_at: Optional[str] = None
+    status: str = "completed"
+    error: Optional[str] = None
+    # Include scanner confidence for comparison (read-only, from original finding)
+    scanner_confidence: Optional[float] = None
+    scanner_severity: Optional[str] = None
+
+
+class AIStatusResponse(BaseModel):
+    """Response for /ai/status endpoint."""
+    ai_enabled: bool
+    ollama_available: bool
+    model_available: bool
+    ai_ready: bool
+    model: str
+    base_url: str
+    timeout: int
+    available_models: Optional[List[str]] = None
+    error: Optional[str] = None
+
+
+class AIBatchRequest(BaseModel):
+    """Request body for batch analysis."""
+    simulate: Optional[bool] = False
+    max_concurrency: int = Field(default=1, ge=1, le=10)
+
+
+# ── Tool Status ────────────────────────────────────────────────────────────────
+
+class ToolStatus(BaseModel):
+    """Status of a single security tool."""
+    name: str
+    tool_name: str
+    installed: bool
+    available: bool
+    status: str  # "ready" | "unavailable" | "error" | "not_installed"
+    version: Optional[str] = None
+    enabled: bool = True
+    description: Optional[str] = None
+
+
+class ToolStatusResponse(BaseModel):
+    """Aggregate tool status for all scanners."""
+    tools: List[ToolStatus]

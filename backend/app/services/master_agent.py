@@ -2,6 +2,7 @@ import uuid
 import asyncio
 import json
 import os
+import time
 import logging
 import shutil
 from datetime import datetime
@@ -12,6 +13,13 @@ from app.db import crud
 from app.services import report_generator
 from app.services.tool_manager import ToolManager
 from app.services.target_normalizer import TargetNormalizer
+from app.services.finding_normalizer import dedup_findings
+from app.services.planning import (
+    MasterSecurityAgent, AssessmentPlan, SecurityTask,
+    AgentResult, MasterDecision, SecurityPolicy, PolicyValidation,
+    TaskStatus, DecisionType, DecisionOutcome, Priority,
+)
+from app.services.ai_engine import AIEngine, AIUnavailableError, AIError
 from urllib.parse import urlparse
 import aiohttp
 
@@ -19,11 +27,15 @@ logger = logging.getLogger(__name__)
 
 
 def calculate_risk_score(findings: List[Dict[str, Any]]) -> int:
-    """Calculate overall risk score based on findings severity."""
+    """Calculate overall risk score based on findings severity.
+
+    Severity penalty weights (higher = more severe):
+        CRITICAL = 50, HIGH = 25, MEDIUM = 10, LOW = 3, INFO = 1
+    """
     if not findings:
         return 100
 
-    severity_weights = {"HIGH": 25, "MEDIUM": 10, "LOW": 3}
+    severity_weights = {"CRITICAL": 50, "HIGH": 25, "MEDIUM": 10, "LOW": 3, "INFO": 1}
     total_penalty = sum(severity_weights.get(f.get("severity", "LOW"), 3) for f in findings)
     score = max(0, 100 - total_penalty)
     return score
@@ -631,6 +643,9 @@ async def report_node(state: CyberPilotState) -> CyberPilotState:
     await crud.update_scan_session(state["scan_id"], "COMPLETED", "report")
     await _emit(state["scan_id"], "phase", {"phase": "COMPLETED", "message": "Generating reports..."})
 
+    # Deduplicate findings before persistence (same vulnerability reported by multiple scanners)
+    state["all_findings"] = dedup_findings(state["all_findings"])
+
     # Persist final results
     finding_ids = await crud.complete_scan(state["scan_id"], state["overall_score"],
                                            state["all_findings"], state.get("data_source", "real_tools"))
@@ -690,18 +705,31 @@ async def report_node(state: CyberPilotState) -> CyberPilotState:
     })
 
     # ── Clean up temporary clone directories ──
-    nt = state.get("target_normalized")
-    if nt and nt.get("clone_dir"):
-        clone_dir = nt["clone_dir"]
-        if clone_dir and os.path.isdir(clone_dir):
-            # Only remove directories we created (under /tmp)
-            real_clone = os.path.realpath(clone_dir)
-            tmp_base = os.path.realpath("/tmp")
-            if real_clone.startswith(tmp_base):
-                shutil.rmtree(real_clone, ignore_errors=True)
-                logger.info("Cleaned up temporary clone: %s", real_clone)
+    _cleanup_clone(state)
 
     return state
+
+
+def _cleanup_clone(state: CyberPilotState) -> None:
+    """Safely remove temporary clone directories created by TargetNormalizer.
+
+    Only removes directories under the system temp dir.  Never touches
+    user-supplied local paths.
+    """
+    nt = state.get("target_normalized")
+    if not nt:
+        return
+    clone_dir = nt.get("clone_dir")
+    if not clone_dir:
+        return
+    if not os.path.isdir(clone_dir):
+        return
+    # Only remove directories we created (under /tmp)
+    real_clone = os.path.realpath(clone_dir)
+    tmp_base = os.path.realpath("/tmp")
+    if real_clone.startswith(tmp_base):
+        shutil.rmtree(real_clone, ignore_errors=True)
+        logger.info("Cleaned up temporary clone: %s", real_clone)
 
 
 def _build_remediation_details(findings: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
@@ -829,10 +857,493 @@ def _generate_references(agent: str, severity: str, description: str,
     return refs
 
 
+# ── Phase 5: Planning Node ─────────────────────────────────────────────────────
+
+# Module-level singleton; reset per scan in start_scan_workflow
+_master_agent: Optional[MasterSecurityAgent] = None
+_start_time: float = 0.0
+
+
+def _get_master_agent() -> MasterSecurityAgent:
+    """Get or create the MasterSecurityAgent singleton."""
+    global _master_agent
+    if _master_agent is None:
+        _master_agent = MasterSecurityAgent()
+    return _master_agent
+
+
+async def planning_node(state: CyberPilotState) -> CyberPilotState:
+    """Phase 5: Create a structured AssessmentPlan from the normalized target.
+
+    Uses MasterSecurityAgent.create_assessment_plan() with deterministic
+    target-aware task selection (Phase 1 routing). The plan is validated
+    by SecurityPolicy and persisted to the database.
+    """
+    global _start_time
+    _start_time = time.time()
+
+    scan_id = state["scan_id"]
+    await _emit(scan_id, "phase", {
+        "phase": "PLANNING",
+        "message": "Creating assessment plan..."
+    })
+
+    nt = state.get("target_normalized") or {}
+    target_kind = nt.get("kind", "invalid")
+
+    master_agent = _get_master_agent()
+    authorize = state.get("authorize", False)
+
+    plan = master_agent.create_assessment_plan(
+        target=state["target_url"],
+        target_kind=target_kind,
+        target_normalized=nt,
+        authorize=authorize,
+    )
+
+    # Validate plan with security policy
+    policy = SecurityPolicy(
+        authorized_target=plan.authorized_target,
+        authorization_mode=plan.authorization_mode,
+        allow_active_scanning=plan.allow_active_scanning,
+        allow_private_targets=plan.allow_private_targets,
+        max_tasks=plan.max_tasks,
+        max_runtime_seconds=plan.max_runtime_seconds,
+    )
+
+    validation = policy.validate_plan(plan)
+
+    # Create a decision record for the plan
+    decision = MasterDecision(
+        decision_type=DecisionType.PLAN.value,
+        outcome=validation.decision,
+        reason=validation.reason,
+    )
+    await crud.save_decision(scan_id, decision.to_dict())
+    state["decisions"] = state.get("decisions", []) + [decision.to_dict()]
+    state["policy_decisions"] = state.get("policy_decisions", []) + [
+        {"plan_id": plan.plan_id, "validation": validation.to_dict()}
+    ]
+
+    # Persist plan to DB
+    await crud.save_assessment_plan(scan_id, plan.to_dict())
+
+    # Persist tasks to DB and state
+    task_dicts = [t.to_dict() for t in plan.tasks]
+    await crud.save_all_tasks(scan_id, task_dicts)
+
+    state["assessment_plan"] = plan.to_dict()
+    state["tasks"] = task_dicts
+    state["agent_results"] = state.get("agent_results", [])
+    state["decisions"] = state.get("decisions", [])
+    state["policy_decisions"] = state.get("policy_decisions", [])
+    state["iteration"] = 0
+    state["max_iterations"] = plan.max_iterations
+    state["ai_analyses"] = state.get("ai_analyses", [])
+    state["task_results"] = state.get("task_results", {})
+    state["completion_reason"] = None
+    state["scan_budget"] = {
+        "max_iterations": plan.max_iterations,
+        "max_tasks": plan.max_tasks,
+        "max_runtime_seconds": plan.max_runtime_seconds,
+        "tasks_started": 0,
+        "tasks_completed": 0,
+        "start_time": _start_time,
+    }
+
+    await _emit(scan_id, "progress", {
+        "message": f"Assessment plan created: {len(plan.tasks)} tasks",
+        "task_count": len(plan.tasks),
+    })
+
+    for task in plan.tasks:
+        await _emit(scan_id, "progress", {
+            "message": f"Task planned: {task.agent} → {task.tool}",
+            "task_id": task.task_id,
+            "agent": task.agent,
+            "tool": task.tool,
+            "priority": task.priority,
+            "scan_mode": task.scan_mode,
+        })
+
+    state["status"] = "PLANNED"
+    await crud.update_scan_status(scan_id, state["status"])
+    return state
+
+
+# ── Phase 5: AI Analysis Node ────────────────────────────────────────────────────
+
+async def ai_analysis_node(state: CyberPilotState) -> CyberPilotState:
+    """Phase 5: Run AIEngine analysis on all findings from the current iteration.
+
+    Uses AIEngine.analyze_findings() — the Phase 3 AI engine is reused, not
+    duplicated. Findings are never modified — AIAnalysis is a separate object.
+    """
+    scan_id = state["scan_id"]
+    findings = state.get("all_findings", [])
+
+    if not findings:
+        await _emit(scan_id, "progress", {
+            "message": "AI analysis skipped — no findings to analyze"
+        })
+        return state
+
+    await _emit(scan_id, "phase", {
+        "phase": "AI_ANALYSIS",
+        "message": f"Running AI analysis on {len(findings)} findings..."
+    })
+
+    master_agent = _get_master_agent()
+    ai_engine = master_agent.ai_engine
+
+    try:
+        analyses = await ai_engine.analyze_findings(findings, max_concurrency=1)
+
+        # Store AI analyses separately from findings (Phase 3 §4 principle)
+        ai_analysis_list = []
+        for analysis in analyses:
+            analysis_dict = analysis.model_dump() if hasattr(analysis, 'model_dump') else dict(analysis)
+            ai_analysis_list.append(analysis_dict)
+
+            # Persist to DB
+            await crud.create_ai_analysis(
+                finding_id=analysis_dict.get("finding_id"),
+                scan_id=scan_id,
+                model=analysis_dict.get("model", "unknown"),
+                analysis=analysis_dict,
+                ai_confidence=analysis_dict.get("confidence"),
+                status=analysis_dict.get("status", "completed"),
+                prompt_version=analysis_dict.get("prompt_version", "v1.0"),
+                error=analysis_dict.get("error"),
+            )
+
+        state["ai_analyses"] = state.get("ai_analyses", []) + ai_analysis_list
+
+        for analysis in ai_analysis_list:
+            await _emit(scan_id, "progress", {
+                "message": f"AI analysis completed for finding",
+                "finding_id": analysis.get("finding_id"),
+                "priority": analysis.get("priority"),
+                "confidence": analysis.get("confidence"),
+            })
+
+    except AIUnavailableError:
+        logger.warning("AI analysis unavailable — continuing with scanner findings only")
+        await _emit(scan_id, "progress", {
+            "message": "AI analysis unavailable — skipping (AI is optional)"
+        })
+    except Exception as e:
+        logger.warning("AI analysis error: %s", e)
+        await _emit(scan_id, "progress", {
+            "message": f"AI analysis failed: {e}",
+            "error": str(e),
+        })
+
+    return state
+
+
+# ── Phase 5: Decide Node ───────────────────────────────────────────────────────
+
+async def decide_node(state: CyberPilotState) -> CyberPilotState:
+    """Phase 5: Master Agent evaluates findings and decides next action.
+
+    Examines high-severity findings + AI analyses, creates follow-up tasks
+    where additional validation is useful, checks stopping criteria,
+    and routes to either iteration or final reporting.
+    """
+    scan_id = state["scan_id"]
+    state["status"] = "EVALUATION"
+    await crud.update_scan_status(scan_id, state["status"])
+
+    master_agent = _get_master_agent()
+
+    # Build policy from plan
+    plan_dict = state.get("assessment_plan", {})
+    policy = SecurityPolicy(
+        authorized_target=plan_dict.get("authorized_target", ""),
+        authorization_mode=plan_dict.get("authorization_mode", "explicit"),
+        allow_active_scanning=plan_dict.get("allow_active_scanning", False),
+        allow_private_targets=plan_dict.get("allow_private_targets", False),
+        max_tasks=plan_dict.get("max_tasks", 30),
+        max_runtime_seconds=plan_dict.get("max_runtime_seconds", 900),
+    )
+
+    findings = state.get("all_findings", [])
+    ai_analyses = state.get("ai_analyses", [])
+    authorize = state.get("authorize", False)
+
+    # Check for cancellation
+    scan_cancelled = await crud.is_scan_cancelled(scan_id)
+
+    # Build AI analysis lookup
+    ai_lookup: Dict[int, Dict[str, Any]] = {}
+    for analysis in ai_analyses:
+        if analysis.get("finding_id"):
+            ai_lookup[analysis["finding_id"]] = analysis
+
+    # Evaluate each new high-severity finding for follow-up
+    followup_tasks: List[SecurityTask] = []
+    for finding in findings:
+        # Skip if this finding was already processed for follow-up
+        finding_id = finding.get("id")
+        ai_analysis = ai_lookup.get(finding_id) if finding_id else None
+
+        task = master_agent.evaluate_finding_for_followup(
+            finding=finding,
+            ai_analysis=ai_analysis,
+            authorized_target=state["target_url"],
+            allow_active=authorize,
+        )
+
+        if task:
+            # Validate follow-up task through policy
+            validation = policy.validate_task(task, scan_cancelled=scan_cancelled)
+
+            decision = MasterDecision(
+                decision_type=DecisionType.FOLLOW_UP.value,
+                outcome=validation.decision,
+                reason=validation.reason,
+                task_id=task.task_id,
+                tool=task.tool,
+                target=task.target,
+                policy_validation=validation.to_dict() if not validation.approved else None,
+            )
+            await crud.save_decision(scan_id, decision.to_dict())
+            state["decisions"] = state.get("decisions", []) + [decision.to_dict()]
+            state["policy_decisions"] = state.get("policy_decisions", []) + [
+                {"task_id": task.task_id, "validation": validation.to_dict()}
+            ]
+
+            if validation.approved:
+                task.status = TaskStatus.APPROVED.value
+                task_dict = task.to_dict()
+                await crud.save_task(scan_id, task_dict)
+                state["tasks"] = state.get("tasks", []) + [task_dict]
+                followup_tasks.append(task)
+                await _emit(scan_id, "progress", {
+                    "message": f"Follow-up task created: {task.agent} → {task.tool}",
+                    "task_id": task.task_id,
+                    "tool": task.tool,
+                })
+            else:
+                await _emit(scan_id, "progress", {
+                    "message": f"Follow-up task blocked by policy: {task.tool}",
+                    "reason": validation.reason,
+                })
+
+    # Check stopping criteria
+    plan_dict = state.get("assessment_plan", {})
+    plan_for_stop = AssessmentPlan(
+        target=plan_dict.get("target", state["target_url"]),
+        target_kind=plan_dict.get("target_kind", "unknown"),
+        authorized_target=plan_dict.get("authorized_target", state["target_url"]),
+        authorization_mode=plan_dict.get("authorization_mode", "explicit"),
+        allow_active_scanning=plan_dict.get("allow_active_scanning", False),
+        allow_private_targets=plan_dict.get("allow_private_targets", False),
+        objective=plan_dict.get("objective", "assessment"),
+        max_iterations=plan_dict.get("max_iterations", 5),
+        max_tasks=plan_dict.get("max_tasks", 30),
+        max_runtime_seconds=plan_dict.get("max_runtime_seconds", 900),
+    )
+
+    should_stop, stop_reason = master_agent.should_stop(
+        iteration=state.get("iteration", 0) + 1,
+        plan=plan_for_stop,
+        tasks=[SecurityTask(**t) for t in state.get("tasks", [])],
+        findings=findings,
+        start_time=state.get("scan_budget", {}).get("start_time", time.time()),
+    )
+
+    # Also check budget exhaustion
+    budget = state.get("scan_budget", {})
+    if not should_stop:
+        if budget.get("tasks_started", 0) >= budget.get("max_tasks", 30):
+            should_stop = True
+            stop_reason = f"Maximum tasks budget exhausted ({budget['max_tasks']})"
+        elif budget.get("tasks_completed", 0) >= 1 and not followup_tasks:
+            # No new follow-up tasks created
+            should_stop = True
+            stop_reason = "No additional high-value follow-up tasks identified"
+
+    if should_stop:
+        state["completion_reason"] = stop_reason
+        await _emit(scan_id, "progress", {
+            "message": f"Assessment stopping: {stop_reason}",
+            "completion_reason": stop_reason,
+        })
+        state["status"] = "COMPLETED"
+        await crud.update_scan_status(scan_id, state["status"])
+    else:
+        state["iteration"] = state.get("iteration", 0) + 1
+        for task in followup_tasks:
+            task.status = TaskStatus.RUNNING.value
+            await crud.update_task_status(
+                task.task_id, TaskStatus.RUNNING.value,
+                started_at=datetime.utcnow().isoformat(),
+            )
+        budget["tasks_started"] = budget.get("tasks_started", 0) + len(followup_tasks)
+        state["scan_budget"] = budget
+        await _emit(scan_id, "progress", {
+            "message": f"Starting iteration {state['iteration']} with {len(followup_tasks)} follow-up tasks",
+            "iteration": state["iteration"],
+        })
+        state["status"] = "RUNNING"
+        await crud.update_scan_status(scan_id, state["status"])
+
+    return state
+
+
+async def execute_followup_node(state: CyberPilotState) -> CyberPilotState:
+    """Phase 5: Execute approved follow-up tasks via ToolManager.
+
+    This is the execution boundary — all tool execution goes through
+    ToolManager (Phase 5 §2). No direct shell commands.
+    """
+    scan_id = state["scan_id"]
+    tasks = state.get("tasks", [])
+
+    # Find approved/running tasks for this iteration
+    new_tasks = [t for t in tasks if t.get("status") == TaskStatus.RUNNING.value]
+
+    if not new_tasks:
+        return state
+
+    tool_manager = ToolManager()
+    authorize = state.get("authorize", False)
+
+    for task in new_tasks:
+        await crud.update_task_status(
+            task["task_id"], TaskStatus.RUNNING.value,
+            started_at=datetime.utcnow().isoformat(),
+        )
+        await _emit(scan_id, "progress", {
+            "message": f"Executing task: {task['agent']} → {task['tool']}",
+            "task_id": task["task_id"],
+        })
+
+        try:
+            agent_name = task["agent"]
+            target = task["target"]
+            tool_name = task["tool"]
+
+            # Prepare tool-specific kwargs
+            tool_kwargs = task.get("config", {}).copy()
+            tool_kwargs["scan_type"] = task.get("scan_mode", "passive")
+            tool_kwargs["allow_internal"] = authorize
+
+            result = await tool_manager.run_agent_tools(
+                agent_name, target, **tool_kwargs
+            )
+
+            task["status"] = TaskStatus.COMPLETED.value
+            task["completed_at"] = datetime.utcnow().isoformat()
+            task["agent_result"] = result
+
+            await crud.update_task_status(
+                task["task_id"], TaskStatus.COMPLETED.value,
+                completed_at=datetime.utcnow().isoformat(),
+                agent_result=result,
+            )
+
+            # Record agent result
+            agent_result = AgentResult(
+                agent=agent_name,
+                task_id=task["task_id"],
+                status="completed",
+                findings=result.get("findings", []),
+                observations=[],
+                recommendations=[],
+                tool_results=result.get("tools_run", []),
+                errors=result.get("errors", []),
+                duration=result.get("tools_run", [{}])[0].get("duration", 0) if result.get("tools_run") else 0,
+            )
+            state["agent_results"] = state.get("agent_results", []) + [agent_result.to_dict()]
+            state["task_results"][task["task_id"]] = agent_result.to_dict()
+
+            # Merge findings into all_findings
+            new_findings = result.get("findings", [])
+            if new_findings:
+                state["all_findings"] = dedup_findings(state.get("all_findings", []) + new_findings)
+                await _emit(scan_id, "finding_batch", {
+                    "agent": agent_name,
+                    "count": len(new_findings),
+                    "task_id": task["task_id"],
+                })
+
+            budget = state.get("scan_budget", {})
+            budget["tasks_completed"] = budget.get("tasks_completed", 0) + 1
+            state["scan_budget"] = budget
+
+        except Exception as e:
+            task["status"] = TaskStatus.FAILED.value
+            task["completed_at"] = datetime.utcnow().isoformat()
+            await crud.update_task_status(
+                task["task_id"], TaskStatus.FAILED.value,
+                completed_at=datetime.utcnow().isoformat(),
+            )
+            await _emit(scan_id, "error", {
+                "message": f"Task failed: {e}",
+                "task_id": task["task_id"],
+                "tool": task["tool"],
+            })
+            logger.warning("Follow-up task %s failed: %s", task["task_id"], e)
+
+    return state
+
+
+# ── Phase 5: Conditional Routing ─────────────────────────────────────────────────
+
+def _route_after_planning(state: CyberPilotState) -> str:
+    """Route after planning: always proceed to recon (existing workflow)."""
+    return "recon"
+
+
+def _route_after_decide(state: CyberPilotState) -> str:
+    """Route after decide: continue iteration or go to report."""
+    if state.get("completion_reason"):
+        return "risk_scoring"
+    return "execute_followup"
+
+
 # ── Graph Construction ─────────────────────────────────────────────────────────
 
 def build_master_agent_graph() -> StateGraph:
+    """Build the Phase 5 Master Agent graph.
+
+    Graph flow (Phase 5):
+
+      planning → recon → security_analysis → ai_analysis → decide
+                                                              ↓
+                                                  (more work?) → execute_followup
+                                                              ↓ no
+                                                      risk_scoring
+                                                              ↓
+                                                        compliance
+                                                              ↓
+                                                    recommendations
+                                                              ↓
+                                                              report
+                                                              ↓
+                                                             END
+
+    The planning node creates a structured AssessmentPlan.
+    The ai_analysis node runs AIEngine on findings.
+    The decide node evaluates findings + creates follow-up tasks.
+    If follow-up tasks exist and budget allows → execute_followup → back to ai_analysis.
+    If done → risk_scoring → compliance → recommendations → report → END.
+
+    Existing nodes (recon, security_analysis, risk_scoring, compliance,
+    recommendations, report) remain unchanged.
+    """
     workflow = StateGraph(CyberPilotState)
+
+    # Phase 5 nodes
+    workflow.add_node("planning", planning_node)
+    workflow.add_node("ai_analysis", ai_analysis_node)
+    workflow.add_node("decide", decide_node)
+    workflow.add_node("execute_followup", execute_followup_node)
+
+    # Existing nodes (unchanged)
     workflow.add_node("recon", recon_node)
     workflow.add_node("security_analysis", security_analysis_node)
     workflow.add_node("risk_scoring", risk_scoring_node)
@@ -840,15 +1351,40 @@ def build_master_agent_graph() -> StateGraph:
     workflow.add_node("recommendations", recommendation_node)
     workflow.add_node("report", report_node)
 
-    workflow.set_entry_point("recon")
+    # Entry: planning first, then existing recon
+    workflow.set_entry_point("planning")
+    workflow.add_edge("planning", "recon")
+
+    # Existing linear path (unchanged)
     workflow.add_edge("recon", "security_analysis")
-    workflow.add_edge("security_analysis", "risk_scoring")
+
+    # After security analysis: AI analysis of findings
+    workflow.add_edge("security_analysis", "ai_analysis")
+
+    # AI analysis → decide (evaluate findings, check stopping criteria)
+    workflow.add_edge("ai_analysis", "decide")
+
+    # Conditional: decide → execute_followup (if more work) or → risk_scoring (if done)
+    workflow.add_conditional_edges(
+        "decide",
+        _route_after_decide,
+        {
+            "execute_followup": "execute_followup",
+            "risk_scoring": "risk_scoring",
+        },
+    )
+
+    # Execute follow-up tasks → back to AI analysis (bounded loop)
+    workflow.add_edge("execute_followup", "ai_analysis")
+
+    # Existing post-analysis path
     workflow.add_edge("risk_scoring", "compliance")
     workflow.add_edge("compliance", "recommendations")
     workflow.add_edge("recommendations", "report")
     workflow.add_edge("report", END)
 
-    return workflow.compile()
+    compiled = workflow.compile()
+    return compiled
 
 
 master_agent_app = build_master_agent_graph()
@@ -898,6 +1434,18 @@ async def start_scan_workflow(
         "_scan_started_at": datetime.utcnow().timestamp(),
         "_scan_timeout_seconds": scan_timeout_seconds,
         "target_normalized": None,
+        # Phase 5 state
+        "assessment_plan": None,
+        "tasks": [],
+        "agent_results": [],
+        "decisions": [],
+        "policy_decisions": [],
+        "iteration": 0,
+        "max_iterations": 5,
+        "ai_analyses": [],
+        "task_results": {},
+        "completion_reason": None,
+        "scan_budget": {},
     }
 
     # Normalize the target once — clone repos if needed.
@@ -919,6 +1467,9 @@ async def start_scan_workflow(
                 "clone_dir": normalized.clone_dir,
                 "scanners": normalized.scanners,
             }
+            # Store clone_dir in DB so cancel/timeout handlers can clean up
+            if normalized.clone_dir:
+                await crud.set_scan_clone_dir(scan_id, normalized.clone_dir)
             if not normalized.error:
                 logger.info(
                     "Target type: %s. Web scanners: %s. Code scanners: %s.",
@@ -949,6 +1500,7 @@ async def start_scan_workflow(
             await crud.update_scan_status(scan_id, "TIMEOUT")
             await crud.update_scan_session(scan_id, "TIMEOUT", "watchdog")
             await crud.update_scan_error(scan_id, f"Scan timed out after {scan_timeout_seconds}s")
+            await crud.cleanup_scan_clone(scan_id)
             await _emit(scan_id, "error", {"message": f"Scan timed out after {scan_timeout_seconds}s"})
 
     asyncio.create_task(_watchdog())

@@ -18,29 +18,32 @@ class TrivyScanner(BaseScanner):
 
     @property
     def command_name(self) -> str:
-        import os
-        binary_path = "/tmp/bin/trivy"
-        if os.path.isfile(binary_path) and os.access(binary_path, os.X_OK):
-            return binary_path
-        return "trivy"
+        import shutil
+        binary_path = shutil.which("trivy")
+        return binary_path if binary_path else "trivy"
 
     async def check_installed(self) -> bool:
-        """Check if trivy is installed. Looks in /tmp/bin first."""
-        import os
-        binary_path = "/tmp/bin/trivy"
-        if os.path.isfile(binary_path) and os.access(binary_path, os.X_OK):
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    binary_path, "--version",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                await proc.communicate()
-                return proc.returncode == 0
-            except Exception:
-                pass
-        # Fallback to PATH lookup
-        return await super().check_installed()
+        """Check if trivy is installed and on PATH (via shutil.which)."""
+        import shutil
+        binary = shutil.which("trivy")
+        if not binary:
+            return False
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                binary, "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate()
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    async def check_available(self) -> tuple[bool, str]:
+        """Check if trivy is installed and can run a basic command."""
+        if not await self.check_installed():
+            return False, "Trivy is not installed or not in PATH"
+        return True, "Trivy is available"
 
     # Map legacy vuln_type values (os,lang,config,secret) to trivy 0.74+ --scanners values
     _VULN_TYPE_MAP = {
@@ -49,6 +52,18 @@ class TrivyScanner(BaseScanner):
         "config": "misconfig",
         "secret": "secret",
     }
+
+    _VALID_TRIVY_SEVERITIES = {"UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"}
+
+    def _filter_severity(self, severity_str: str) -> str:
+        """Filter severity string to only include values Trivy accepts."""
+        if not severity_str:
+            return "HIGH,CRITICAL"
+        parts = [p.strip().upper() for p in severity_str.split(",") if p.strip()]
+        filtered = [p for p in parts if p in self._VALID_TRIVY_SEVERITIES]
+        if not filtered:
+            return "HIGH,CRITICAL"
+        return ",".join(filtered)
 
     def _build_scanners_arg(self, kwargs: Dict) -> str:
         """Convert vuln_type or scanners kwarg to a --scanners value string."""
@@ -93,24 +108,36 @@ class TrivyScanner(BaseScanner):
         # Build trivy command
         scan_type = kwargs.get("scan_type", "auto")
 
-        if scan_type == "image":
-            return await self._scan_image(target, kwargs)
-        elif scan_type == "fs":
-            return await self._scan_filesystem(target, kwargs)
-        elif scan_type == "repo":
-            return await self._scan_repo(target, kwargs)
-        elif scan_type == "k8s":
-            return await self._scan_k8s(target, kwargs)
-        elif scan_type == "config":
-            return await self._scan_config(target, kwargs)
-        else:
-            # Auto-detect based on target
-            if target.startswith(("http://", "https://", "git@")):
-                return await self._scan_repo(target, kwargs)
-            elif ":" in target and not target.startswith("/"):
+        try:
+            if scan_type == "image":
                 return await self._scan_image(target, kwargs)
-            else:
+            elif scan_type == "fs":
                 return await self._scan_filesystem(target, kwargs)
+            elif scan_type == "repo":
+                return await self._scan_repo(target, kwargs)
+            elif scan_type == "k8s":
+                return await self._scan_k8s(target, kwargs)
+            elif scan_type == "config":
+                return await self._scan_config(target, kwargs)
+            else:
+                # Auto-detect based on target
+                if target.startswith(("http://", "https://", "git@")):
+                    return await self._scan_repo(target, kwargs)
+                elif ":" in target and not target.startswith("/"):
+                    return await self._scan_image(target, kwargs)
+                else:
+                    return await self._scan_filesystem(target, kwargs)
+        except asyncio.TimeoutError:
+            return self.create_timeout_result(time.time() - start_time)
+        except Exception as e:
+            duration = time.time() - start_time
+            return ScanResult(
+                tool_name=self.tool_name,
+                status=ScanStatus.FAILED,
+                findings=[],
+                error=str(e),
+                duration_seconds=duration,
+            )
 
     def _build_base_args(self, subcommand: str, target: str, kwargs: Dict, scan_type_label: str) -> List[str]:
         """Build the common trivy args for any subcommand."""
@@ -118,7 +145,11 @@ class TrivyScanner(BaseScanner):
         args.extend(["-f", "json"])
         args.extend(["-q", "--no-progress", "--skip-version-check"])
 
-        severity = kwargs.get("severity", "HIGH,CRITICAL")
+        # Add --skip-db-update if requested (avoids DB update on first run)
+        if kwargs.get("skip_db_update", True):
+            args.append("--skip-db-update")
+
+        severity = self._filter_severity(kwargs.get("severity", "HIGH,CRITICAL"))
         args.extend(["--severity", severity])
 
         scanners = self._build_scanners_arg(kwargs)
@@ -132,10 +163,6 @@ class TrivyScanner(BaseScanner):
 
     async def _run_trivy(self, args: List[str], scan_type_label: str, start_time: float) -> ScanResult:
         """Run trivy, handling --skip-db-update first-run failures."""
-        # Try with --skip-db-update first
-        if "--skip-db-update" in args or True:  # We add it below conditionally
-            pass
-
         returncode, stdout, stderr = await self.run_command(args)
 
         # If --skip-db-update caused a first-run error, retry without it
@@ -193,7 +220,7 @@ class TrivyScanner(BaseScanner):
 
         args = [self.command_name, "k8s", target]
         args.extend(["-f", "json", "-q", "--no-progress", "--skip-version-check"])
-        severity = kwargs.get("severity", "HIGH,CRITICAL")
+        severity = self._filter_severity(kwargs.get("severity", "HIGH,CRITICAL"))
         args.extend(["--severity", severity])
         scanners = self._build_scanners_arg(kwargs)
         args.extend(["--scanners", scanners])
@@ -258,6 +285,7 @@ class TrivyScanner(BaseScanner):
                         "target_class": target_class,
                         "target_type": target_type,
                         "vuln_id": vuln.get("VulnerabilityID", ""),
+                        "cve": vuln.get("VulnerabilityID", ""),
                         "pkg_name": vuln.get("PkgName", ""),
                         "installed_version": vuln.get("InstalledVersion", ""),
                         "fixed_version": vuln.get("FixedVersion", ""),
@@ -266,13 +294,16 @@ class TrivyScanner(BaseScanner):
                         "description": vuln.get("Description", ""),
                         "references": vuln.get("References", []),
                         "cvss": vuln.get("CVSS", {}),
-                        "cwe_ids": vuln.get("CweIDs", []),
+                        "cwe": vuln.get("CweIDs", []),
                         "remediation": f"Upgrade {vuln.get('PkgName', 'package')} to version {vuln.get('FixedVersion', 'latest')} or apply vendor patch."
                     })
 
                 # Secrets
                 secrets = result.get("Secrets", [])
                 for secret in secrets:
+                    # Redact the raw match value to avoid leaking secrets
+                    from app.services.finding_normalizer import redact_sensitive_text
+                    raw_match = secret.get("Match", "")
                     findings.append({
                         "type": "secret",
                         "tool": "trivy",
@@ -283,7 +314,7 @@ class TrivyScanner(BaseScanner):
                         "category": secret.get("Category", ""),
                         "title": secret.get("Title", ""),
                         "description": f"[{secret.get('RuleID', '')}] {secret.get('Title', '')} in {target}:{secret.get('StartLine', 0)}",
-                        "match": secret.get("Match", ""),
+                        "match": redact_sensitive_text(raw_match),
                         "file": target,  # filepath is in the parent result's Target field
                         "line": secret.get("StartLine", 0),
                         "remediation": "Remove the secret from code. Rotate the credential immediately and store in a secure secret management system."

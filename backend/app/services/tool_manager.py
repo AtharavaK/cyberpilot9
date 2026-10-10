@@ -7,6 +7,10 @@ import logging
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 
+from app.services.finding_normalizer import (
+    build_canonical_finding, finding_fingerprint, normalize_severity,
+    normalize_confidence, redact_sensitive_text, dedup_findings,
+)
 from app.services.tools import (
     TOOL_REGISTRY,
     DEFAULT_TOOL_CONFIGS,
@@ -172,63 +176,27 @@ class ToolManager:
                 logger.error(error_msg)
                 results["errors"].append(error_msg)
         
+        # Deduplicate findings within this agent's results
+        results["findings"] = dedup_findings(results["findings"])
+        results["findings_count"] = len(results["findings"])
         return results
     
     def _standardize_finding(self, raw_finding: Dict[str, Any], agent_name: str, tool_name: str) -> Dict[str, Any]:
-        """Convert tool-specific finding to standard format."""
-        # Copy over any extra fields that don't have a dedicated slot,
-        # so downstream consumers (e.g. recon_node) can still see them.
-        raw_type = raw_finding.get("type", "")
-        metadata_extra = {}
-        # nmap findings carry a nested service dict under "service"
-        if raw_type == "open_port" and raw_finding.get("service"):
-            metadata_extra["service"] = raw_finding["service"]
-        # code scanners carry file/line — already handled below, but preserve any extra
-        for k in ("file", "line", "rule_id", "cwe", "owasp", "references", "protocol"):
-            if k in raw_finding and k not in ("file", "line", "rule_id", "cwe", "owasp", "references"):
-                metadata_extra[k] = raw_finding[k]
+        """Convert tool-specific finding to canonical standard format.
 
-        severity_map = {
-            "CRITICAL": "HIGH",
-            "HIGH": "HIGH",
-            "MEDIUM": "MEDIUM",
-            "LOW": "LOW",
-            "INFO": "LOW",
-            "UNKNOWN": "LOW"
-        }
+        Delegates to ``finding_normalizer.build_canonical_finding`` which
+        normalizes severity, confidence, CWE/CVE, file/line, references
+        and redacts any secret-like values in evidence.
 
-        raw_severity = raw_finding.get("severity", "INFO").upper()
-        standard_severity = severity_map.get(raw_severity, "LOW")
-
-        # Get remediation
-        remediation = raw_finding.get("remediation", "")
-        if not remediation:
-            remediation = self._get_default_remediation(raw_finding, tool_name)
-
-        # Build base metadata
-        metadata = {
-            "tool": tool_name,
-            "raw_type": raw_type,
-            "raw_severity": raw_finding.get("severity", ""),
-            "rule_id": raw_finding.get("rule_id", ""),
-            "file": raw_finding.get("file", ""),
-            "line": raw_finding.get("line", 0),
-            "port": raw_finding.get("port", 0),
-            "cwe": raw_finding.get("cwe", []),
-            "owasp": raw_finding.get("owasp", []),
-            "references": raw_finding.get("references", []),
-        }
-        # Merge in any extra fields captured above
-        metadata.update(metadata_extra)
-
-        return {
-            "agent_name": agent_name,
-            "tool": tool_name,
-            "severity": standard_severity,
-            "description": raw_finding.get("description", ""),
-            "remediation": remediation,
-            "metadata": metadata
-        }
+        Scanner-specific fields that don't fit the canonical schema are
+        preserved in ``metadata`` so downstream consumers (e.g. recon_node)
+        can still access them.
+        """
+        canonical = build_canonical_finding(raw_finding, agent_name, tool_name)
+        # Ensure remediation falls back to default if missing
+        if not canonical.get("remediation"):
+            canonical["remediation"] = self._get_default_remediation(raw_finding, tool_name)
+        return canonical
     
     def _get_default_remediation(self, finding: Dict[str, Any], tool_name: str) -> str:
         """Generate default remediation based on tool and finding type."""

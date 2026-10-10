@@ -6,6 +6,9 @@ __pycache__/
 .Python
 venv/
 venv_linux/
+backend/.venv/
+backend/venv/
+backend/venv_linux/
 *.egg-info/
 dist/
 build/
@@ -41,3 +44,10 @@ output/
 
 # Logs
 *.log
+
+# Test & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/

@@ -1,16 +1,57 @@
-# React + Vite
+# CyberPilot Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+A React + Vite single-page application for the CyberPilot security
+assessment platform. It communicates with the FastAPI backend via a REST
+API and renders scan results, findings, AI analysis, and reports.
 
-Currently, two official plugins are available:
+## Development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+### Prerequisites
 
-## React Compiler
+- Node.js 20+
+- npm
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+### Install dependencies
 
-## Expanding the Oxlint configuration
+```bash
+npm install
+```
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+### Start development server
+
+```bash
+npm run dev
+```
+
+The dev server starts on `http://localhost:5173` and proxies API requests
+to `http://localhost:8000` (the backend).
+
+### Run tests
+
+```bash
+npm run test
+# or
+npx vitest run
+```
+
+### Build for production
+
+```bash
+npm run build
+```
+
+The built files are output to `dist/` and are served by the backend
+during normal operation.
+
+### Project structure
+
+```
+src/
+├── pages/              # Route-level pages (Dashboard, Findings, Reports, etc.)
+├── components/         # Reusable UI components
+├── services/           # API client (api.js)
+├── context/            # React context for shared state
+├── types/              # Shared type definitions
+├── assets/             # Static assets
+└── __tests__/          # Vitest test suite
+```

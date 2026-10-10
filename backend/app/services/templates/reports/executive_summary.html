@@ -169,6 +169,8 @@
         .severity-badge.high { background: #fee2e2; color: #dc2626; }
         .severity-badge.medium { background: #ffedd5; color: #ea580c; }
         .severity-badge.low { background: #dcfce7; color: #16a34a; }
+        .severity-badge.critical { background: #f3e8ff; color: #7c3aed; }
+        .severity-badge.info { background: #f1f5f9; color: #64748b; }
         .finding-agent {
             font-size: 0.85rem;
             color: #64748b;
@@ -236,6 +238,14 @@
     </div>
 
     <div class="stats-grid">
+        <div class="stat-card total">
+            <div class="number">{{ total_findings }}</div>
+            <div class="label">Total Findings</div>
+        </div>
+        <div class="stat-card" style="border-color: #8b5cf6; background: #f3e8ff;">
+            <div class="number" style="color: #7c3aed;">{{ critical_count }}</div>
+            <div class="label">Critical</div>
+        </div>
         <div class="stat-card high">
             <div class="number">{{ high_count }}</div>
             <div class="label">High Severity</div>
@@ -248,10 +258,7 @@
             <div class="number">{{ low_count }}</div>
             <div class="label">Low Severity</div>
         </div>
-        <div class="stat-card total">
-            <div class="number">{{ total_findings }}</div>
-            <div class="label">Total Findings</div>
-        </div>
+    </div>
     </div>
 
     {% if top_risks %}

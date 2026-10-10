@@ -1,21 +1,35 @@
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from app.models.schemas import (
     ScanRequest, ScanResponse, ReportSummary, ComplianceFinding, Finding,
     ScanStatusResponse, ScanEvent, ScanEventsResponse,
     FindingsGroup, FindingsExplorerResponse,
     TriageRequest, TriageResponse,
-    ScanTrendResponse,
-    DashboardStatsResponse,
+    ScanTrendResponse, DashboardStatsResponse,
+    ToolStatus, ToolStatusResponse,
     WebhookRequest, WebhookResponse,
     RemediationDetailsResponse, RemediationStep,
+    AIAnalysisSchema, AIAnalysisCreate, AIStatusResponse, AIBatchRequest,
 )
 from app.services import master_agent
+from app.services.ai_engine import (
+    AIEngine, AIAnalysis as AIAnalysisModel, AIUnavailableError,
+    AIValidationError, AIError,
+)
+from app.services.tools import (
+    NmapScanner, SemgrepScanner, BanditScanner,
+    GitleaksScanner, TrivyScanner, ZapScanner, AISecurityTester,
+)
 from app.db import crud
 from app.api.auth import validate_api_key
 import os
 import sys
 import json
+import logging
+from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter()
@@ -158,7 +172,7 @@ async def download_executive_summary(scan_id: str, current_user: dict = Depends(
     if result["status"] != "COMPLETED":
         raise HTTPException(status_code=400, detail="Scan not completed yet")
 
-    final_report = result.get("final_report", {})
+    final_report = result.get("final_report") or {}
     if isinstance(final_report, str):
         try:
             final_report = json.loads(final_report)
@@ -189,7 +203,7 @@ async def download_technical_report(scan_id: str, current_user: dict = Depends(g
     if result["status"] != "COMPLETED":
         raise HTTPException(status_code=400, detail="Scan not completed yet")
 
-    final_report = result.get("final_report", {})
+    final_report = result.get("final_report") or {}
     if isinstance(final_report, str):
         try:
             final_report = json.loads(final_report)
@@ -207,6 +221,44 @@ async def download_technical_report(scan_id: str, current_user: dict = Depends(g
 
     return FileResponse(pdf_path, media_type="application/pdf",
                         filename=f"{scan_id}_technical_report.pdf")
+
+
+# ── Target Validation ──────────────────────────────────────────────────────────
+
+class TargetValidationRequest(BaseModel):
+    target_url: str
+
+class TargetValidationResponse(BaseModel):
+    target_url: str
+    valid: bool
+    target_kind: str
+    normalized: str
+    error: Optional[str] = None
+
+@router.post("/scan/validate", response_model=TargetValidationResponse)
+async def validate_scan_target(
+    request: TargetValidationRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Validate and classify a target URL without starting a scan.
+
+    Uses the backend TargetNormalizer to detect target type.
+    """
+    from app.services.target_normalizer import TargetNormalizer
+    from app.services.target_validation import validate_target
+    import dataclasses
+
+    norm = TargetNormalizer()
+    nt = await norm.normalize(request.target_url)
+    nt_dict = dataclasses.asdict(nt)
+    is_valid, reason = validate_target(request.target_url)
+    return TargetValidationResponse(
+        target_url=request.target_url,
+        valid=is_valid,
+        target_kind=nt_dict.get("kind", "unknown"),
+        normalized=nt_dict.get("web_target") or request.target_url,
+        error=None if is_valid else reason,
+    )
 
 
 # ── Findings Explorer (grouped) ─────────────────────────────────────────────────
@@ -261,6 +313,8 @@ async def cancel_scan(scan_id: str, current_user: dict = Depends(get_current_use
         raise HTTPException(status_code=400, detail=f"Cannot cancel scan in status '{result['status']}'")
     await crud.mark_scan_cancelled(scan_id)
     await crud.add_scan_event(scan_id, "control", {"action": "cancel", "message": "Scan cancelled by user"})
+    # Clean up any temporary clone directories
+    await crud.cleanup_scan_clone(scan_id)
     return {"scan_id": scan_id, "status": "CANCELLED", "message": "Scan cancellation requested"}
 
 
@@ -305,18 +359,67 @@ async def get_findings_explorer(scan_id: str, current_user: dict = Depends(get_c
         # Try loading from DB directly
         db_scan = await crud.get_scan(scan_id)
         findings_raw = db_scan.get("findings", []) if db_scan else []
+    else:
+        db_scan = await crud.get_scan(scan_id)
+        findings_raw = db_scan.get("findings", []) if db_scan else findings_raw
 
-    # Convert to Finding objects
+    # Convert raw DB dicts (which already have id + metadata JSON) to Finding objects
     findings = []
     for f in findings_raw:
-        finding = Finding(
+        meta = f.get("metadata", {})
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        if isinstance(meta, dict):
+            file_path = f.get("file") or meta.get("file", "")
+            line = f.get("line") or meta.get("line", 0) or 0
+            cwe = f.get("cwe") or meta.get("cwe", [])
+            cve = f.get("cve") or meta.get("cve", [])
+            refs = f.get("references") or meta.get("references", [])
+            tool = f.get("tool") or meta.get("tool", "")
+            title = f.get("title") or meta.get("title", "")
+            category = f.get("category") or meta.get("raw_type", "")
+            evidence = f.get("evidence") or meta.get("evidence", "")
+            target = f.get("target") or meta.get("target", "")
+            confidence = f.get("confidence") or meta.get("confidence")
+            data_source = f.get("data_source") or ""
+        else:
+            file_path = ""
+            line = 0
+            cwe = []
+            cve = []
+            refs = []
+            tool = ""
+            title = ""
+            category = ""
+            evidence = ""
+            target = ""
+            confidence = None
+            data_source = ""
+
+        finding_obj = Finding(
+            id=f.get("id"),
             agent_name=f.get("agent_name", "Unknown"),
+            tool=tool or None,
             severity=f.get("severity", "LOW"),
+            confidence=confidence,
+            title=title or None,
+            category=category or None,
             description=f.get("description", ""),
+            evidence=evidence or None,
             remediation=f.get("remediation"),
-            metadata=f.get("metadata"),
+            target=target or None,
+            file=file_path or None,
+            line=line,
+            cwe=cwe if cwe else None,
+            cve=cve if cve else None,
+            references=refs if isinstance(refs, list) else None,
+            data_source=data_source or None,
+            metadata=meta if isinstance(meta, dict) else None,
         )
-        findings.append(finding)
+        findings.append(finding_obj)
 
     # Group by agent
     by_agent_map: dict = {}
@@ -338,7 +441,7 @@ async def get_findings_explorer(scan_id: str, current_user: dict = Depends(get_c
         by_severity_map[key]["findings"].append(f)
         by_severity_map[key]["count"] = len(by_severity_map[key]["findings"])
 
-    severity_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     by_severity = sorted(by_severity_map.values(),
                          key=lambda x: severity_order.get(x["severity"], 99))
 
@@ -357,6 +460,15 @@ async def get_findings_explorer(scan_id: str, current_user: dict = Depends(get_c
         triage_summary=triage_summary,
         total_findings=len(findings),
     )
+
+
+@router.get("/scan/{scan_id}/findings/list", response_model=List[Finding])
+async def get_findings_list(scan_id: str, current_user: dict = Depends(get_current_user)):
+    """Return a flat list of all findings for a scan with full detail."""
+    result = await master_agent.get_scan_result(scan_id)
+    if result["status"] == "NOT_FOUND":
+        raise HTTPException(status_code=404, detail="Scan ID not found")
+    return result.get("all_findings", result.get("findings", []))
 
 
 # ── Finding Triage ─────────────────────────────────────────────────────────────
@@ -617,3 +729,678 @@ async def test_webhook(request: WebhookRequest, current_user: dict = Depends(get
                 }
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Webhook test failed: {str(e)}")
+
+
+# ─── ZAP Scanner Endpoints (Phase 4) ──────────────────────────────────────
+
+from app.services.tools.zap_scanner import ZapScanner
+
+
+def _get_zap_scanner(simulate: bool = False) -> ZapScanner:
+    """Factory for ZapScanner instances (allows override in tests)."""
+    return ZapScanner({
+        "simulated": simulate,
+        "scan_mode": os.environ.get("ZAP_MODE", "passive"),
+    })
+
+
+@router.get("/tools/zap/status")
+async def zap_status(current_user: dict = Depends(get_current_user)):
+    """Get the current status of the OWASP ZAP integration.
+
+    Returns availability, installation status, and configuration.
+    """
+    scanner = _get_zap_scanner()
+    status = await scanner.get_status()
+    return status
+
+
+# ─── Tool Status ───────────────────────────────────────────────────────────────
+
+_TOOL_MAP = {
+    "Nmap": NmapScanner,
+    "Semgrep": SemgrepScanner,
+    "Bandit": BanditScanner,
+    "Gitleaks": GitleaksScanner,
+    "Trivy": TrivyScanner,
+    "OWASP ZAP": ZapScanner,
+    "AI Security Tester": AISecurityTester,
+}
+
+_TOOL_DESCRIPTIONS = {
+    "Nmap": "Network mapper — port discovery, OS detection, service fingerprinting",
+    "Semgrep": "Static analysis — finds security issues in source code",
+    "Bandit": "Python static analysis — security linting for Python code",
+    "Gitleaks": "Secret detection — finds exposed credentials in source code",
+    "Trivy": "Vulnerability scanner — container images, filesystems, config",
+    "OWASP ZAP": "Web application security scanner — XSS, SQLi, auth, API",
+    "AI Security Tester": "AI/ML security testing — prompt injection, data exposure",
+}
+
+
+@router.get("/tools/status", response_model=ToolStatusResponse)
+async def get_tools_status(current_user: dict = Depends(get_current_user)):
+    """Return the installation/availability status of all security tools."""
+    import asyncio as _asyncio
+
+    results = []
+    for name, cls in _TOOL_MAP.items():
+        scanner = cls({})
+        installed = await scanner.check_installed()
+        enabled = scanner.config.get("enabled", True) if hasattr(scanner, "config") else True
+        if installed:
+            status = "ready"
+            available = True
+        else:
+            status = "not_installed"
+            available = False
+
+        # Try to get version
+        version = None
+        if installed:
+            try:
+                import asyncio as _asyncio
+                proc = await _asyncio.create_subprocess_exec(
+                    scanner.command_name, "--version",
+                    stdout=_asyncio.subprocess.PIPE,
+                    stderr=_asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+                output = (stdout.decode('utf-8', errors='replace') + stderr.decode('utf-8', errors='replace')).strip()
+                version = output.split('\n')[0][:120] if output else None
+            except Exception:
+                version = None
+
+        results.append(ToolStatus(
+            name=name,
+            tool_name=scanner.tool_name,
+            installed=installed,
+            available=available,
+            status=status,
+            version=version,
+            enabled=enabled,
+            description=_TOOL_DESCRIPTIONS.get(name, ""),
+        ))
+
+    # Add AI engine status
+    ai_available = False
+    try:
+        engine = AIEngine()
+        status = await engine.get_status()
+        ai_available = status.get("ai_ready", False)
+    except Exception:
+        ai_available = False
+    results.append(ToolStatus(
+        name="AI Engine (Ollama)",
+        tool_name="ollama",
+        installed=True,
+        available=ai_available,
+        status="ready" if ai_available else "unavailable",
+        enabled=True,
+        description="Large language model backend for AI security analysis",
+    ))
+
+    return ToolStatusResponse(tools=results)
+
+
+@router.post("/scans/{scan_id}/zap")
+async def scan_with_zap(
+    scan_id: str,
+    request: Optional[dict] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Run a ZAP scan against a scan target.
+
+    Request body (optional JSON):
+        scan_mode: "passive" | "baseline" | "active" (default: env ZAP_MODE)
+        allow_internal: bool (default: false)
+        target: override target URL (defaults to scan's target_url)
+
+    Returns scan result with findings and status.
+    """
+    # Verify the scan exists
+    scan = await crud.get_scan(scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail=f"Scan {scan_id} not found")
+
+    request = request or {}
+    scan_mode = request.get("scan_mode", os.environ.get("ZAP_MODE", "passive"))
+    allow_internal = request.get("allow_internal", False)
+
+    # Use the scan's target URL, or override from request
+    target = request.get("target") or scan.get("target_url", "")
+    if not target:
+        raise HTTPException(
+            status_code=400,
+            detail="No target URL available for this scan",
+        )
+
+    scanner = _get_zap_scanner(simulate=bool(request.get("simulate")))
+
+    result = await scanner.scan(
+        target,
+        scan_type=scan_mode,
+        allow_internal=allow_internal,
+        timeout=request.get("timeout", scanner.scan_timeout),
+        spider=request.get("spider", scan_mode != "passive"),
+    )
+
+    # Emit event
+    await crud.add_scan_event(scan_id, "zap_scan_completed", {
+        "tool": "zap",
+        "status": result.status.value,
+        "findings_count": len(result.findings),
+        "duration": result.duration_seconds,
+        "error": result.error,
+        "scan_mode": scan_mode,
+    })
+
+    return {
+        "scan_id": scan_id,
+        "tool": "ZAP",
+        "status": result.status.value,
+        "findings_count": len(result.findings),
+        "findings": result.findings,
+        "duration_seconds": result.duration_seconds,
+        "error": result.error,
+    }
+
+
+@router.get("/scans/{scan_id}/zap/status")
+async def zap_scan_status(
+    scan_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Check ZAP tool status (not running scan status — ZAP scans are synchronous)."""
+    scanner = _get_zap_scanner()
+    status = await scanner.get_status()
+    return {"scan_id": scan_id, "tool": "ZAP", **status}
+
+
+# ─── AI Engine Endpoints (Phase 3) ─────────────────────────────────────────────
+
+def _get_ai_engine(simulate: bool = False) -> AIEngine:
+    """Create an AI engine instance, optionally forcing the mock provider."""
+    if simulate:
+        from app.services.ai_engine import MockAIProvider
+        return AIEngine(provider=MockAIProvider(model="mock"))
+    return AIEngine()
+
+
+@router.get("/ai/status", response_model=AIStatusResponse)
+async def get_ai_status(current_user: dict = Depends(get_current_user)):
+    """Check whether the AI engine (Ollama) is available and ready."""
+    engine = _get_ai_engine()
+    status = await engine.get_status()
+    return AIStatusResponse(**status)
+
+
+@router.post("/findings/{finding_id}/analyze", response_model=AIAnalysisSchema)
+async def analyze_finding(
+    finding_id: int,
+    request: Optional[AIBatchRequest] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Analyze a single finding via the AI engine.
+
+    Loads the finding from the DB, redacts any remaining secrets, sends the
+    safe finding to the AI engine, validates the response, and persists the
+    analysis.  The original finding is never modified.
+    """
+    # 1. Load the finding
+    async with crud.get_connection() as conn:
+        cursor = await conn.execute(
+            """SELECT f.id, f.agent_name, f.severity, f.description, f.remediation,
+                      f.metadata, f.created_at,
+                      s.scan_id, s.target_url, s.data_source
+               FROM findings f
+               JOIN scans s ON f.scan_id = s.scan_id
+               WHERE f.id = ?""",
+            (finding_id,),
+        )
+        row = await cursor.fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Finding {finding_id} not found")
+
+    finding = dict(row)
+    if finding.get("metadata"):
+        try:
+            finding["metadata"] = json.loads(finding["metadata"])
+        except (json.JSONDecodeError, TypeError):
+            finding["metadata"] = {}
+
+    # Apply canonical field mapping (same as get_findings_by_scan / get_scan)
+    meta = finding.get("metadata", {})
+    agent_name = finding.get("agent_name", "unknown")
+    finding["scanner"] = meta.get("tool") or agent_name
+    finding["agent"] = agent_name
+    finding["location"] = {
+        "file": meta.get("file", ""),
+        "line": meta.get("line", 0),
+        "path": meta.get("file", ""),
+        "line_number": meta.get("line", 0),
+    }
+    finding["file"] = meta.get("file", "")
+    finding["line"] = meta.get("line", 0)
+    finding["title"] = meta.get("title", finding.get("description", "")[:80])
+    finding["evidence"] = meta.get("evidence")
+    finding["cwe"] = meta.get("cwe")
+    finding["cve"] = meta.get("cve")
+    finding["references"] = meta.get("references", [])
+    finding["target"] = meta.get("target", "")
+    finding["confidence"] = meta.get("confidence")
+    finding["data_source"] = meta.get("data_source") or finding.get("data_source") or "real_tools"
+    finding["scan_id"] = finding.get("scan_id") or ""
+
+    # 2. Analyze via AI engine
+    simulate = bool(request and request.simulate)
+    engine = _get_ai_engine(simulate=simulate)
+
+    try:
+        analysis = await engine.analyze_finding(finding)
+    except AIUnavailableError as e:
+        raise HTTPException(status_code=503, detail=f"AI engine unavailable: {e}")
+    except AIValidationError as e:
+        raise HTTPException(status_code=502, detail=f"AI response validation failed: {e}")
+
+    # 3. Persist the analysis
+    try:
+        analysis_dict = analysis.model_dump()
+        analysis_id = await crud.create_ai_analysis(
+            finding_id=finding["id"],
+            scan_id=finding["scan_id"],
+            model=analysis.model,
+            analysis=analysis_dict,
+            ai_confidence=analysis.confidence,
+            status=analysis.status,
+            prompt_version=analysis.prompt_version,
+            error=analysis.error,
+        )
+    except Exception as e:
+        logger.warning("Failed to persist AI analysis for finding %d: %s", finding_id, e)
+        # Still return the analysis even if DB persistence fails
+
+    # 4. Build response with scanner confidence/severity preserved separately
+    return AIAnalysisSchema(
+        finding_id=analysis.finding_id,
+        scan_id=analysis.scan_id,
+        summary=analysis.summary,
+        risk_explanation=analysis.risk_explanation,
+        exploitability=analysis.exploitability,
+        impact=analysis.impact,
+        false_positive_assessment=analysis.false_positive_assessment,
+        confidence=analysis.confidence,
+        root_cause=analysis.root_cause,
+        remediation=analysis.remediation,
+        references=analysis.references,
+        priority=analysis.priority,
+        model=analysis.model,
+        created_at=analysis.created_at,
+        status=analysis.status,
+        error=analysis.error,
+        scanner_confidence=finding.get("confidence"),
+        scanner_severity=finding.get("severity"),
+    )
+
+
+@router.get("/findings/{finding_id}/analysis", response_model=AIAnalysisSchema)
+async def get_finding_analysis(
+    finding_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Retrieve the most recent AI analysis for a finding."""
+    result = await crud.get_ai_analysis_by_finding(finding_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="No AI analysis found for this finding")
+
+    analysis = result.get("analysis", {})
+
+    # Look up the original finding for scanner confidence/severity
+    scanner_confidence = None
+    scanner_severity = None
+    async with crud.get_connection() as conn:
+        cursor = await conn.execute(
+            """SELECT f.severity, f.metadata
+               FROM findings f WHERE f.id = ?""",
+            (finding_id,),
+        )
+        row = await cursor.fetchone()
+        if row:
+            scanner_severity = row["severity"]
+            meta = {}
+            if row["metadata"]:
+                try:
+                    meta = json.loads(row["metadata"])
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+            scanner_confidence = meta.get("confidence")
+
+    return AIAnalysisSchema(
+        finding_id=result.get("finding_id"),
+        scan_id=result.get("scan_id"),
+        summary=analysis.get("summary", ""),
+        risk_explanation=analysis.get("risk_explanation", ""),
+        exploitability=analysis.get("exploitability", "uncertain"),
+        impact=analysis.get("impact", ""),
+        false_positive_assessment=analysis.get("false_positive_assessment", "uncertain"),
+        confidence=analysis.get("confidence", 0.0),
+        root_cause=analysis.get("root_cause"),
+        remediation=analysis.get("remediation", ""),
+        references=analysis.get("references", []),
+        priority=analysis.get("priority"),
+        model=result.get("model", "unknown"),
+        prompt_version=result.get("prompt_version", "v1.0"),
+        created_at=result.get("created_at"),
+        status=result.get("status", "completed"),
+        error=result.get("error"),
+        scanner_confidence=scanner_confidence,
+        scanner_severity=scanner_severity,
+    )
+
+
+@router.post("/scans/{scan_id}/analyze")
+async def analyze_scan_findings(
+    scan_id: str,
+    request: Optional[AIBatchRequest] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Analyze all findings in a scan via the AI engine.
+
+    Retrieves findings, optionally prioritizes critical/high findings first,
+    analyzes them through the AI engine with controlled concurrency, and
+    handles individual AI failures without failing the entire batch.
+    """
+    result = await master_agent.get_scan_result(scan_id)
+    if result["status"] == "NOT_FOUND":
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    findings = result.get("all_findings", [])
+    if not findings:
+        # Try loading from DB
+        db_scan = await crud.get_scan(scan_id)
+        if db_scan:
+            findings = db_scan.get("findings", [])
+
+    if not findings:
+        return {"scan_id": scan_id, "analyzed": 0, "results": []}
+
+    # Prioritize: critical/high findings first
+    severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    findings_sorted = sorted(
+        findings,
+        key=lambda f: severity_order.get(
+            (f.get("severity") or "low").upper(), 5
+        ),
+    )
+
+    simulate = bool(request and request.simulate)
+    max_concurrency = request.max_concurrency if request else 1
+    engine = _get_ai_engine(simulate=simulate)
+
+    # Analyze sequentially (controlled concurrency; default max_concurrency=1)
+    analyses: List[Dict[str, Any]] = []
+    failed = 0
+    succeeded = 0
+
+    for finding in findings_sorted:
+        try:
+            analysis = await engine.analyze_finding(finding)
+            # Persist
+            try:
+                analysis_dict = analysis.model_dump()
+                analysis_id = await crud.create_ai_analysis(
+                    finding_id=finding.get("id"),
+                    scan_id=scan_id,
+                    model=analysis.model,
+                    analysis=analysis_dict,
+                    ai_confidence=analysis.confidence,
+                    status=analysis.status,
+                    prompt_version=analysis.prompt_version,
+                    error=analysis.error,
+                )
+            except Exception as e:
+                logger.warning("Failed to persist AI analysis: %s", e)
+
+            analyses.append({
+                "finding_id": finding.get("id"),
+                "severity": finding.get("severity"),
+                "scanner": finding.get("scanner", "unknown"),
+                "analysis": analysis.model_dump(),
+            })
+            succeeded += 1
+
+        except AIError as e:
+            logger.warning("AI analysis failed for finding %s: %s", finding.get("id"), e)
+            failed += 1
+            # Record failure but continue
+            await crud.create_ai_analysis(
+                finding_id=finding.get("id") or 0,
+                scan_id=scan_id,
+                model=engine.provider.get_model_name(),
+                analysis={},
+                ai_confidence=0.0,
+                status="failed",
+                error=str(e),
+            )
+            analyses.append({
+                "finding_id": finding.get("id"),
+                "severity": finding.get("severity"),
+                "error": str(e),
+            })
+
+    return {
+        "scan_id": scan_id,
+        "total_findings": len(findings_sorted),
+        "analyzed": succeeded,
+        "failed": failed,
+        "results": analyses,
+    }
+
+
+@router.post("/findings/{finding_id}/analysis/retry", response_model=AIAnalysisSchema)
+async def retry_finding_analysis(
+    finding_id: int,
+    request: Optional[AIBatchRequest] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Retry AI analysis for a finding that previously failed."""
+    simulate = bool(request and request.simulate)
+    engine = _get_ai_engine(simulate=simulate)
+
+    # Load the finding (same as analyze_finding)
+    async with crud.get_connection() as conn:
+        cursor = await conn.execute(
+            """SELECT f.id, f.agent_name, f.severity, f.description, f.remediation,
+                      f.metadata, f.created_at,
+                      s.scan_id, s.target_url, s.data_source
+               FROM findings f
+               JOIN scans s ON f.scan_id = s.scan_id
+               WHERE f.id = ?""",
+            (finding_id,),
+        )
+        row = await cursor.fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Finding {finding_id} not found")
+
+    finding = dict(row)
+    if finding.get("metadata"):
+        try:
+            finding["metadata"] = json.loads(finding["metadata"])
+        except (json.JSONDecodeError, TypeError):
+            finding["metadata"] = {}
+
+    meta = finding.get("metadata", {})
+    agent_name = finding.get("agent_name", "unknown")
+    finding["scanner"] = meta.get("tool") or agent_name
+    finding["agent"] = agent_name
+    finding["file"] = meta.get("file", "")
+    finding["line"] = meta.get("line", 0)
+    finding["title"] = meta.get("title", finding.get("description", "")[:80])
+    finding["evidence"] = meta.get("evidence")
+    finding["cwe"] = meta.get("cwe")
+    finding["cve"] = meta.get("cve")
+    finding["references"] = meta.get("references", [])
+    finding["target"] = meta.get("target", "")
+    finding["confidence"] = meta.get("confidence")
+    finding["data_source"] = meta.get("data_source") or finding.get("data_source") or "real_tools"
+
+    try:
+        analysis = await engine.analyze_finding(finding)
+    except AIUnavailableError as e:
+        raise HTTPException(status_code=503, detail=f"AI engine unavailable: {e}")
+    except AIValidationError as e:
+        raise HTTPException(status_code=502, detail=f"AI response validation failed: {e}")
+
+    # Update the failed analysis record or create a new one
+    old_analysis = await crud.get_ai_analysis_by_finding(finding_id)
+    if old_analysis:
+        await crud.update_ai_analysis_status(
+            old_analysis["id"], "completed", error=None
+        )
+
+    try:
+        analysis_dict = analysis.model_dump()
+        await crud.create_ai_analysis(
+            finding_id=finding["id"],
+            scan_id=finding["scan_id"],
+            model=analysis.model,
+            analysis=analysis_dict,
+            ai_confidence=analysis.confidence,
+            status=analysis.status,
+        )
+    except Exception as e:
+        logger.warning("Failed to persist retried AI analysis: %s", e)
+
+    return AIAnalysisSchema(
+        finding_id=analysis.finding_id,
+        scan_id=analysis.scan_id,
+        summary=analysis.summary,
+        risk_explanation=analysis.risk_explanation,
+        exploitability=analysis.exploitability,
+        impact=analysis.impact,
+        false_positive_assessment=analysis.false_positive_assessment,
+        confidence=analysis.confidence,
+        root_cause=analysis.root_cause,
+        remediation=analysis.remediation,
+        references=analysis.references,
+        priority=analysis.priority,
+        model=analysis.model,
+        created_at=analysis.created_at,
+        status=analysis.status,
+        error=analysis.error,
+        scanner_confidence=finding.get("confidence"),
+        scanner_severity=finding.get("severity"),
+    )
+
+
+# ─── Phase 5: Orchestration Endpoints ────────────────────────────────────────────
+
+@router.get("/scans/{scan_id}/plan")
+async def get_assessment_plan(
+    scan_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get the assessment plan for a scan (Phase 5)."""
+    try:
+        from app.db.database import get_connection
+        async with get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT * FROM assessment_plans WHERE scan_id = ?",
+                (scan_id,),
+            )
+            row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404, detail=f"No assessment plan found for scan {scan_id}"
+            )
+        plan = dict(row)
+        if plan.get("plan_json"):
+            try:
+                plan["plan"] = json.loads(plan["plan_json"])
+            except (json.JSONDecodeError, TypeError):
+                plan["plan"] = {}
+        return plan
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to retrieve plan: {e}"
+        )
+
+
+@router.get("/scans/{scan_id}/tasks")
+async def get_scan_tasks(
+    scan_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get all assessment tasks for a scan (Phase 5)."""
+    try:
+        tasks = await crud.get_tasks_by_scan(scan_id)
+        return {"scan_id": scan_id, "tasks": tasks, "count": len(tasks)}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to retrieve tasks: {e}"
+        )
+
+
+@router.get("/scans/{scan_id}/decisions")
+async def get_scan_decisions(
+    scan_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get the audit trail of Master Agent decisions (Phase 5)."""
+    try:
+        decisions = await crud.get_decisions_by_scan(scan_id)
+        return {
+            "scan_id": scan_id,
+            "decisions": decisions,
+            "count": len(decisions),
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to retrieve decisions: {e}"
+        )
+
+
+@router.get("/scans/{scan_id}/agent-results")
+async def get_agent_results(
+    scan_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get agent execution results for a scan (Phase 5)."""
+    try:
+        scan = await crud.get_scan(scan_id)
+        if not scan:
+            raise HTTPException(
+                status_code=404, detail=f"Scan {scan_id} not found"
+            )
+        tasks = await crud.get_tasks_by_scan(scan_id)
+        agent_results = [
+            {
+                "task_id": t.get("task_id"),
+                "agent": t.get("agent"),
+                "tool": t.get("tool"),
+                "objective": t.get("objective"),
+                "status": t.get("status"),
+                "priority": t.get("priority"),
+                "scan_mode": t.get("scan_mode"),
+                "created_at": t.get("created_at"),
+                "started_at": t.get("started_at"),
+                "completed_at": t.get("completed_at"),
+                "agent_result": t.get("agent_result_json") or {},
+            }
+            for t in tasks
+        ]
+        return {
+            "scan_id": scan_id,
+            "agent_results": agent_results,
+            "count": len(agent_results),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to retrieve agent results: {e}"
+        )

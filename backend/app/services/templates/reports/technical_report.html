@@ -125,6 +125,8 @@
         .finding-item.high { border-left: 4px solid #ef4444; }
         .finding-item.medium { border-left: 4px solid #f59e0b; }
         .finding-item.low { border-left: 4px solid #10b981; }
+        .finding-item.critical { border-left: 4px solid #7c3aed; }
+        .finding-item.info { border-left: 4px solid #94a3b8; }
         .finding-header {
             display: flex;
             justify-content: space-between;
@@ -148,6 +150,8 @@
         .severity-badge.high { background: #fee2e2; color: #dc2626; }
         .severity-badge.medium { background: #ffedd5; color: #ea580c; }
         .severity-badge.low { background: #dcfce7; color: #16a34a; }
+        .severity-badge.critical { background: #f3e8ff; color: #7c3aed; }
+        .severity-badge.info { background: #f1f5f9; color: #64748b; }
         .finding-meta {
             display: flex;
             gap: 1rem;
@@ -333,6 +337,30 @@
             <div class="finding-remediation">
                 <strong>Remediation:</strong> {{ finding.remediation or 'No specific remediation provided.' }}
             </div>
+            {% set meta = finding.metadata or {} %}
+            {% if finding.file or meta.file %}
+            <div class="finding-meta">
+                <span><strong>File:</strong> {{ finding.file or meta.file }}</span>
+                {% if finding.line or meta.line %}
+                <span><strong>Line:</strong> {{ finding.line or meta.line }}</span>
+                {% endif %}
+                {% if finding.tool or meta.tool %}
+                <span><strong>Scanner:</strong> {{ finding.tool or meta.tool }}</span>
+                {% endif %}
+            </div>
+            {% endif %}
+            {% if finding.cwe or meta.cwe %}
+            <div class="finding-meta">
+                <strong>CWE:</strong>
+                {% set cwe_list = finding.cwe or meta.cwe if meta.cwe is iterable else [meta.cwe] %}
+                {% for cwe in (finding.cwe or meta.cwe or []) %}
+                    {% if loop.first %}<span class="compliance-tag nist">{{ cwe }}</span>{% else %}<span class="compliance-tag nist">{{ cwe }}</span>{% endif %}
+                {% endfor %}
+            </div>
+            {% endif %}
+            {% if finding.evidence %}
+            <div class="finding-evidence" style="margin-top: 0.5rem; padding: 0.5rem; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 4px; font-family: monospace; font-size: 0.8rem; white-space: pre-wrap; word-break: break-all;">{{ finding.evidence }}</div>
+            {% endif %}
             
             {% if compliance_by_agent.get(finding.agent_name) %}
             <div class="compliance-mapping">

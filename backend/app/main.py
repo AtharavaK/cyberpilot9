@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,6 +7,11 @@ import sys as _sys
 import webbrowser
 import threading
 import time
+import secrets
+import hashlib
+from collections import defaultdict
+from app.api.auth import require_auth_or_bootstrap
+from app.db import crud
 
 # ── Path resolution ──────────────────────────────────────────────────────────
 # PyInstaller one-dir mode: bundled files are in _MEIPASS (next to .exe as _internal/)
@@ -47,6 +52,15 @@ else:
 # Fresh-start flag: standalone .exe always starts with no pre-existing keys
 _HAS_EXISTING_KEYS = False
 
+# ── /setup rate limiting (first-run bootstrap + local recovery) ─────────────────
+# Only the no-auth /setup endpoint creates keys without authentication.
+# A simple in-memory rate limiter prevents uncontrolled key creation while
+# preserving legitimate first-run setup and one-shot local key recovery.
+_SETUP_CREATION_TIMES: defaultdict[str, list] = defaultdict(list)
+_SETUP_RATE_LIMIT_WINDOW = 3600        # 1-hour sliding window
+_SETUP_RATE_LIMIT_MAX = 10            # max 10 key creations per hour per IP
+_SETUP_MIN_INTERVAL = 10              # min 10 seconds between creations per IP
+
 app = FastAPI(
     title="CyberPilot",
     description="Agentic AI Platform for Autonomous Security Assessment",
@@ -54,11 +68,24 @@ app = FastAPI(
 )
 
 # CORS
-_raw_origins = _os.environ.get("APP_CORS_ORIGINS",
-    "http://localhost:5173,http://localhost:5174,http://localhost:5175,"
-    "http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:5175,"
-    "http://localhost:3000,http://127.0.0.1:3000,http://localhost:*")
+# Development: allow the known frontend dev origin only.
+# Production: require explicitly configured origins (APP_CORS_ORIGINS env var).
+# Note: http://localhost:* is NOT a real CORS wildcard — Starlette treats it
+# as a literal origin string that never matches any browser origin, providing
+# no actual security but giving a false sense of permissiveness. It is removed.
+_default_dev_origins = (
+    "http://localhost:5173,http://127.0.0.1:5173"
+)
+_raw_origins = _os.environ.get("APP_CORS_ORIGINS", _default_dev_origins)
 _ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+# In production mode, do not allow wildcard origins
+_is_production = _os.environ.get("APP_ENV", "development").lower() == "production"
+if _is_production and ("*" in _ALLOWED_ORIGINS or any("*" in o for o in _ALLOWED_ORIGINS)):
+    _ALLOWED_ORIGINS = [o for o in _ALLOWED_ORIGINS if "*" not in o]
+    if not _ALLOWED_ORIGINS:
+        _ALLOWED_ORIGINS = ["http://localhost:8000"]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
@@ -311,14 +338,42 @@ async def setup_page(request: Request):
     return HTMLResponse(_SETUP_PAGE)
 
 @app.post("/setup", response_class=JSONResponse)
-async def create_first_key(name: str = Form("default")):
-    """Create the first API key."""
-    import secrets, hashlib, time
-    from app.db import crud
+async def create_first_key(request: Request, name: str = Form("default")):
+    """Create the first API key (first-run bootstrap) or recover a lost key.
+
+    Unauthenticated by design — used when no valid key is available.
+    Rate-limited per client IP to prevent uncontrolled key creation.
+    """
+    client_host = request.client.host if request.client else "unknown"
+    now = time.time()
+
+    # Prune entries outside the sliding window
+    _SETUP_CREATION_TIMES[client_host] = [
+        t for t in _SETUP_CREATION_TIMES[client_host]
+        if now - t < _SETUP_RATE_LIMIT_WINDOW
+    ]
+
+    recent = _SETUP_CREATION_TIMES[client_host]
+    if len(recent) >= _SETUP_RATE_LIMIT_MAX:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. Maximum {_SETUP_RATE_LIMIT_MAX} key creations per hour.",
+            headers={"Retry-After": str(int(_SETUP_RATE_LIMIT_WINDOW - (now - recent[0])) + 1)},
+        )
+
+    if recent and (now - recent[-1]) < _SETUP_MIN_INTERVAL:
+        wait = int(_SETUP_MIN_INTERVAL - (now - recent[-1])) + 1
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limited. Wait {wait} seconds before creating another API key.",
+            headers={"Retry-After": str(wait)},
+        )
+
+    _SETUP_CREATION_TIMES[client_host].append(now)
+
     api_key = f"cpk_{secrets.token_urlsafe(32)}"
     key_hash = hashlib.sha256(api_key.encode()).hexdigest()
     key_prefix = api_key[:8]
-    now = int(time.time())
     await crud.create_api_key(key_hash, key_prefix, name)
     return JSONResponse(content={"key": api_key, "name": name})
 

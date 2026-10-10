@@ -2,6 +2,7 @@
 Security utilities for target validation and SSRF protection.
 """
 import ipaddress
+import os
 import socket
 from urllib.parse import urlparse
 from typing import Tuple, Optional
@@ -77,3 +78,43 @@ def classify_target(target_url: str) -> Tuple[str, bool, Optional[str]]:
 
     is_private = ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
     return (host, is_private, str(ip))
+
+
+def validate_target(target_url: str, allow_private: bool = None) -> Tuple[bool, str]:
+    """Validate a target URL for SSRF safety.
+
+    Returns ``(is_valid, reason)`` where *is_valid* is True when the target
+    is safe to scan and *reason* is an empty string on success or an
+    explanation when the target is blocked.
+
+    Parameters
+    ----------
+    target_url : str
+        The target URL to validate.
+    allow_private : bool or None
+        If None (default), reads ``ZAP_ALLOW_PRIVATE_TARGETS`` from the
+        environment at call time.  If True/False, uses the explicit value.
+        Set to True only when you have explicit authorization to scan
+        this network.
+    """
+    # Read env var at call time so tests with patch.dict work correctly
+    if allow_private is None:
+        allow_private = os.environ.get("ZAP_ALLOW_PRIVATE_TARGETS", "").lower() in (
+            "true", "1", "yes"
+        )
+    try:
+        host, is_private, resolved_ip = classify_target(target_url)
+    except ValueError as e:
+        return (False, str(e))
+
+    if is_private and not allow_private:
+        if resolved_ip:
+            if ipaddress.ip_address(resolved_ip).is_loopback:
+                return (False, "localhost address (blocked)")
+            if ipaddress.ip_address(resolved_ip).is_private:
+                return (False, "private IP range (blocked)")
+            if ipaddress.ip_address(resolved_ip).is_link_local:
+                return (False, "link-local address (blocked)")
+        return (False, f"private or internal target (blocked): {host}")
+
+    return (True, "")
